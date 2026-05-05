@@ -1,0 +1,66 @@
+[package]
+name = "modelproxy"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+
+[lib]
+name = "modelproxy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "modelproxy"
+path = "src/main.rs"
+
+[[bin]]
+name = "modelproxy-gui"
+path = "src/bin/gui.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["macros"] }
+axum-extra = { version = "0.9", features = ["typed-header"] }
+tower-http = { version = "0.5", features = ["cors", "fs", "trace", "limit", "compression-br", "compression-gzip"] }
+http = "1"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono", "json", "uuid"] }
+
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+jsonwebtoken = "9"
+bcrypt = "0.15"
+
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures = "0.3"
+tokio-stream = "0.1"
+
+dashmap = "5"
+parking_lot = "0.12"
+
+config = "0.14"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry"] }
+
+thiserror = "1"
+anyhow = "1"
+
+rand = "0.8"
+base64 = "0.22"
+sha2 = "0.10"
+hex = "0.4"
+aes-gcm = "0.10"
+rpassword = "7"
+
+include_dir = "0.7"
+
+iced = { version = "0.13", default-features = false, features = ["tiny-skia", "tokio"] }
+
+open = "5"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winapi = { version = "0.3", features = ["wincon", "winuser"] }

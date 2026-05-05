@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ModelProxy - 管理后台</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div id="app">
+        <button id="sidebar-toggle" class="sidebar-toggle" aria-label="菜单">
+            <span></span><span></span><span></span>
+        </button>
+        <div id="sidebar-overlay" class="sidebar-overlay"></div>
+        <div id="sidebar" class="sidebar">
+            <div class="sidebar-header">
+                <div class="sidebar-logo">
+                    <div class="sidebar-logo-icon">M</div>
+                    <h2>ModelProxy</h2>
+                </div>
+            </div>
+            <nav class="sidebar-nav">
+                <a href="#" data-page="dashboard" class="nav-link active"><span class="nav-icon">📊</span> <span class="nav-text" data-i18n="dashboard">仪表盘</span></a>
+                <a href="#" data-page="api-keys" class="nav-link"><span class="nav-icon">🔑</span> <span class="nav-text" data-i18n="apiKeys">API密钥</span></a>
+                <a href="#" data-page="my-models" class="nav-link"><span class="nav-icon">🤖</span> <span class="nav-text" data-i18n="myModels">我的模型</span></a>
+                <a href="#" data-page="usage" class="nav-link"><span class="nav-icon">📈</span> <span class="nav-text" data-i18n="usage">用量统计</span></a>
+                <div class="nav-divider"></div>
+                <a href="#" data-page="users" class="nav-link admin-only"><span class="nav-icon">👥</span> <span class="nav-text" data-i18n="userManagement">用户管理</span></a>
+                <a href="#" data-page="upstreams" class="nav-link admin-only"><span class="nav-icon">☁️</span> <span class="nav-text" data-i18n="upstreamServices">上游服务</span></a>
+                <a href="#" data-page="models" class="nav-link admin-only"><span class="nav-icon">⚙️</span> <span class="nav-text" data-i18n="modelManagement">模型管理</span></a>
+                <a href="#" data-page="conditional-aliases" class="nav-link admin-only"><span class="nav-icon">🔀</span> <span class="nav-text" data-i18n="conditionalAliases">智能路由</span></a>
+                <a href="#" data-page="audit" class="nav-link admin-only"><span class="nav-icon">💬</span> <span class="nav-text" data-i18n="auditLogs">会话记录</span></a>
+                <div class="nav-divider"></div>
+                <a href="#" data-page="settings" class="nav-link"><span class="nav-icon">🔧</span> <span class="nav-text" data-i18n="personalSettings">个人设置</span></a>
+            </nav>
+            <div class="sidebar-footer">
+                <div class="user-info">
+                    <span id="user-name">-</span>
+                    <span id="user-role" class="badge">-</span>
+                </div>
+                <div class="sidebar-footer-actions">
+                    <button id="lang-switch-btn" class="btn btn-sm btn-outline lang-switch-btn">English</button>
+                    <button id="logout-btn" class="btn btn-sm btn-outline" style="flex:1;color:#94a3b8;border-color:#475569;" data-i18n="logout">退出登录</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="main" class="main">
+            <div id="login-page" class="page">
+                <div class="login-container">
+                    <div class="login-logo">
+                        <div class="login-logo-icon">M</div>
+                    </div>
+                    <h1>ModelProxy</h1>
+                    <p class="login-subtitle">LLM API Gateway</p>
+                    <form id="login-form">
+                        <div class="form-group">
+                            <label data-i18n="username">用户名</label>
+                            <input type="text" id="login-username" required placeholder="请输入用户名" data-i18n-placeholder="enterUsername">
+                        </div>
+                        <div class="form-group">
+                            <label data-i18n="password">密码</label>
+                            <input type="password" id="login-password" required placeholder="请输入密码" data-i18n-placeholder="enterPassword">
+                        </div>
+                        <button type="submit" class="btn btn-primary btn-block" data-i18n="login">登录</button>
+                    </form>
+                    <div class="login-lang-switch">
+                        <button id="login-lang-switch-btn" class="btn btn-sm btn-outline">English</button>
+                    </div>
+                </div>
+            </div>
+
+            <div id="dashboard-page" class="page hidden">
+                <h1 data-i18n="dashboard">仪表盘</h1>
+                <div id="no-upstream-tip" class="card hidden" style="background: linear-gradient(135deg, #1e3a5f 0%, #1a2744 100%); border: 1px solid #3b82f6; margin-bottom: 20px;">
+                    <div style="display: flex; align-items: center; gap: 16px;">
+                        <div style="font-size: 32px;">🚀</div>
+                        <div style="flex: 1;">
+                            <h3 style="margin: 0 0 8px 0; color: #93c5fd; font-size: 16px;" data-i18n="noUpstreamTitle">还没有添加上游服务</h3>
+                            <p style="margin: 0 0 12px 0; color: #94a3b8; font-size: 13px; line-height: 1.6;" data-i18n="noUpstreamDesc">上游服务就是 AI 模型的来源（比如 OpenAI、Claude 等）。需要先添加一个上游服务，系统才能转发 AI 请求。点击下方按钮开始添加。</p>
+                            <button class="btn btn-primary" onclick="navigateTo('upstreams')" data-i18n="goAddUpstream">去添加上游服务</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <h3 data-i18n="todayRequests">今日请求数</h3>
+                        <p id="stat-requests" class="stat-value">-</p>
+                    </div>
+                    <div class="stat-card">
+                        <h3 data-i18n="todayTokens">今日Token</h3>
+                        <p id="stat-tokens" class="stat-value">-</p>
+                    </div>
+                    <div class="stat-card">
+                        <h3 data-i18n="apiKeyCount">API密钥数</h3>
+                        <p id="stat-keys" class="stat-value">-</p>
+                    </div>
+                    <div class="stat-card">
+                        <h3 data-i18n="dailyQuota">日请求额度</h3>
+                        <p id="stat-daily-quota" class="stat-value">-</p>
+                    </div>
+                    <div class="stat-card">
+                        <h3 data-i18n="monthlyQuota">月请求额度</h3>
+                        <p id="stat-monthly-quota" class="stat-value">-</p>
+                    </div>
+                </div>
+                <div class="card">
+                    <h2 data-i18n="usageTrend">用量趋势</h2>
+                    <div id="usage-chart"></div>
+                </div>
+            </div>
+
+            <div id="my-models-page" class="page hidden">
+                <div class="page-header">
+                    <h1 data-i18n="myModels">我的模型</h1>
+                </div>
+                <div class="card">
+                    <p id="my-models-desc-text"></p>
+                    <div id="my-models-list"></div>
+                </div>
+                
+                <div class="card" id="api-usage-examples" style="margin-top: 20px;">
+                    <h2 data-i18n="apiExamples">API 调用示例</h2>
+                    <div class="tabs">
+                        <button class="tab-btn active" data-tab="curl">cURL</button>
+                        <button class="tab-btn" data-tab="python">Python</button>
+                        <button class="tab-btn" data-tab="nodejs">Node.js</button>
+                    </div>
+                    
+                    <div id="curl-example" class="tab-content active">
+                        <h3>cURL</h3>
+                        <pre><code id="curl-code">curl http://localhost:3000/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer YOUR_API_KEY" \\
+  -d '{
+    "model": "gpt-3.5-turbo",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'</code></pre>
+                    </div>
+                    
+                    <div id="python-example" class="tab-content" style="display: none;">
+                        <h3>Python</h3>
+                        <pre><code id="python-code">import openai
+
+client = openai.OpenAI(
+    api_key="YOUR_API_KEY",
+    base_url="http://localhost:3000/v1"
+)
+
+response = client.chat.completions.create(
+    model="gpt-3.5-turbo",
+    messages=[{"role": "user", "content": "Hello!"}]
+)
+
+print(response.choices[0].message.content)</code></pre>
+                    </div>
+                    
+                    <div id="nodejs-example" class="tab-content" style="display: none;">
+                        <h3>Node.js</h3>
+                        <pre><code id="nodejs-code">const OpenAI = require('openai');
+
+const client = new OpenAI({
+    apiKey: 'YOUR_API_KEY',
+    baseUrl: 'http://localhost:3000/v1'
+});
+
+async function chat() {
+    const response = await client.chat.completions.create({
+        model: 'gpt-3.5-turbo',
+        messages: [{ role: 'user', content: 'Hello!' }]
+    });
+    console.log(response.choices[0].message.content);
+}
+
+chat();</code></pre>
+                    </div>
+                </div>
+            </div>
+
+            <div id="api-keys-page" class="page hidden">
+                <div class="page-header">
+                    <h1 data-i18n="apiKeyManagement">API密钥管理</h1>
+                    <button id="create-key-btn" class="btn btn-primary" data-i18n="createKey">创建密钥</button>
+                </div>
+                <div class="card">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th data-i18n="name">名称</th>
+                                <th data-i18n="keyPrefix">密钥前缀</th>
+                                <th class="admin-only" data-i18n="createUser">创建用户</th>
+                                <th data-i18n="status">状态</th>
+                                <th data-i18n="rpmLimit">RPM限制</th>
+                                <th data-i18n="tpmLimit">TPM限制</th>
+                                <th data-i18n="createdAt">创建时间</th>
+                                <th data-i18n="actions">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="api-keys-list"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div id="usage-page" class="page hidden usage-page">
+                <h1 data-i18n="usageStatistics">用量统计</h1>
+                <div class="filter-bar">
+                    <label data-i18n="timeRange">时间范围：</label>
+                    <input type="date" id="usage-start-date">
+                    <span data-i18n="to">至</span>
+                    <input type="date" id="usage-end-date">
+                    <button id="usage-filter-btn" class="btn btn-sm btn-primary" data-i18n="query">查询</button>
+                </div>
+                <div class="stats-grid usage-stats-grid">
+                    <div class="stat-card">
+                        <h3 data-i18n="totalRequests">总请求数</h3>
+                        <p id="usage-requests" class="stat-value">-</p>
+                    </div>
+                    <div class="stat-card">
+                        <h3 data-i18n="totalTokens">总Token</h3>
+                        <p id="usage-tokens" class="stat-value">-</p>
+                    </div>
+                </div>
+                <div class="card usage-card">
+                    <h2 data-i18n="dailyUsage">每日用量</h2>
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th data-i18n="date">日期</th>
+                                <th data-i18n="requests">请求数</th>
+                                <th data-i18n="tokenCount">Token数</th>
+                            </tr>
+                        </thead>
+                        <tbody id="daily-usage-list"></tbody>
+                    </table>
+                </div>
+                <div class="usage-detail-grid">
+                    <div class="card usage-card admin-only">
+                        <h3 data-i18n="byUserModelStats">按用户调用模型统计</h3>
+                        <table class="table usage-table usage-model-table">
+                            <thead>
+                                <tr>
+                                    <th data-i18n="modelName">模型名称</th>
+                                    <th data-i18n="requestCount">请求次数</th>
+                                    <th data-i18n="consumedTokens">消耗 Tokens</th>
+                                </tr>
+                            </thead>
+                            <tbody id="model-usage-list"></tbody>
+                        </table>
+                    </div>
+
+                    <div class="card usage-card">
+                        <h3 data-i18n="byUpstreamModel">按上游模型统计</h3>
+                        <table class="table usage-table usage-model-table">
+                            <thead>
+                                <tr>
+                                    <th data-i18n="upstreamModel">上游模型</th>
+                                    <th data-i18n="requestCount">请求次数</th>
+                                    <th data-i18n="consumedTokens">消耗 Tokens</th>
+                                </tr>
+                            </thead>
+                            <tbody id="upstream-model-usage-list"></tbody>
+                        </table>
+                    </div>
+
+                    <div class="card usage-card" id="user-usage-card" style="display: none;">
+                        <h3 data-i18n="byUser">按用户统计</h3>
+                        <table class="table usage-table">
+                            <thead>
+                                <tr>
+                                    <th data-i18n="rank">排名</th>
+                                    <th data-i18n="usernameCol">用户名</th>
+                                    <th data-i18n="requestCount">请求次数</th>
+                                    <th data-i18n="consumedTokens">消耗 Tokens</th>
+                                </tr>
+                            </thead>
+                            <tbody id="user-usage-list"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <div id="users-page" class="page hidden admin-only">
+                <div class="page-header">
+                    <h1 data-i18n="userManagementTitle">用户管理</h1>
+                    <button id="create-user-btn" class="btn btn-primary" data-i18n="createUserTitle">创建用户</button>
+                </div>
+                <div class="card">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th data-i18n="username">用户名</th>
+                                <th data-i18n="email">邮箱</th>
+                                <th data-i18n="role">角色</th>
+                                <th data-i18n="status">状态</th>
+                                <th data-i18n="quota">配额</th>
+                                <th data-i18n="dailyRequestLimit">日请求限额</th>
+                                <th data-i18n="monthlyRequestLimit">月请求限额</th>
+                                <th data-i18n="createdAt">创建时间</th>
+                                <th data-i18n="actions">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="users-list"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div id="upstreams-page" class="page hidden admin-only">
+                <div class="page-header">
+                    <h1 data-i18n="upstreamManagement">上游服务管理</h1>
+                    <button id="create-upstream-btn" class="btn btn-primary" data-i18n="addUpstream">添加上游</button>
+                </div>
+                <div class="card">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th data-i18n="name">名称</th>
+                                <th data-i18n="apiType">API类型</th>
+                                <th data-i18n="api_key">API Key</th>
+                                <th data-i18n="status">状态</th>
+                                <th data-i18n="dailyMaxRequests">每日最大请求数</th>
+                                <th data-i18n="monthlyMaxRequests">每月最大请求数</th>
+                                <th data-i18n="actions">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="upstreams-list"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div id="models-page" class="page hidden admin-only">
+                <div class="page-header">
+                    <h1 data-i18n="modelManagementTitle">模型管理</h1>
+                    <button id="fetch-models-btn" class="btn btn-primary" data-i18n="fetchModelsFromUpstream">从上游获取模型</button>
+                </div>
+                <div class="card">
+                    <h2 data-i18n="manualAddModel">手动添加模型</h2>
+                    <div style="display:grid;grid-template-columns:1fr 1fr auto auto;gap:10px;align-items:end;">
+                        <div class="form-group" style="margin-bottom:0;">
+                            <label data-i18n="upstreamService">上游服务</label>
+                            <select id="manual-model-upstream-select"></select>
+                        </div>
+                        <div class="form-group" style="margin-bottom:0;">
+                            <label data-i18n="modelName">模型名称</label>
+                            <input id="manual-model-name-input" type="text" placeholder="例如：gpt-4.1-mini" data-i18n-placeholder="modelPlaceholder">
+                        </div>
+                        <button id="test-manual-model-btn" type="button" class="btn btn-secondary" data-i18n="testModel">测试模型</button>
+                        <button id="add-manual-model-btn" type="button" class="btn btn-primary" data-i18n="addModel">添加模型</button>
+                    </div>
+                </div>
+                <div class="card">
+                    <h2 data-i18n="availableModels">可用模型列表</h2>
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th data-i18n="upstreamService">上游服务</th>
+                                <th data-i18n="modelName">模型名称</th>
+                                <th data-i18n="modelAlias">模型别名</th>
+                                <th data-i18n="modelRequestHeader">模型请求Header</th>
+                                <th data-i18n="retrySettings">重试设置</th>
+                                <th data-i18n="retryFailureAction">超重试动作</th>
+                                <th data-i18n="allUsersVisible">全部用户可见</th>
+                                <th data-i18n="specifiedUsers">指定用户</th>
+                                <th data-i18n="actions">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="models-list"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div id="conditional-aliases-page" class="page hidden admin-only">
+                <div class="page-header">
+                    <h1 data-i18n="conditionalAliasTitle">智能路由</h1>
+                    <button id="create-conditional-alias-btn" type="button" class="btn btn-primary" onclick="openConditionalAliasEditor()" data-i18n="addConditionalAlias">新增智能路由</button>
+                </div>
+                <div class="card">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th data-i18n="alias">别名</th>
+                                <th data-i18n="conditionCount">条件数</th>
+                                <th data-i18n="fallbackUpstream">兜底上游</th>
+                                <th data-i18n="fallbackModel">兜底模型</th>
+                                <th data-i18n="visibility">可见性</th>
+                                <th data-i18n="actions">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="conditional-alias-list"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div id="audit-page" class="page hidden admin-only">
+                <h1 data-i18n="auditLogTitle">会话记录</h1>
+                <div class="filter-bar audit-filter-bar">
+                    <label data-i18n="timeRange">时间范围：</label>
+                    <input type="date" id="audit-start-date">
+                    <span data-i18n="to">至</span>
+                    <input type="date" id="audit-end-date">
+                    <select id="audit-username-filter" class="audit-admin-filter hidden">
+                        <option value="">全部用户</option>
+                    </select>
+                    <input type="text" id="audit-keyword" data-i18n-placeholder="keywordPlaceholder">
+                    <input type="number" id="audit-min-tokens" min="0" data-i18n-placeholder="minToken">
+                    <input type="number" id="audit-max-tokens" min="0" data-i18n-placeholder="maxToken">
+                    <button id="audit-filter-btn" class="btn btn-sm btn-primary" data-i18n="query">查询</button>
+                </div>
+                <div id="audit-result-summary" class="audit-result-summary"></div>
+                <div id="audit-loading" class="audit-loading hidden">
+                    <span class="audit-spinner"></span>
+                    <span id="audit-loading-text"></span>
+                </div>
+                <div class="card">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th data-i18n="time">时间</th>
+                                <th data-i18n="user">用户</th>
+                                <th data-i18n="model">模型</th>
+                                <th data-i18n="status">状态</th>
+                                <th>Token</th>
+                                <th data-i18n="ipAddress">IP地址</th>
+                                <th data-i18n="details">详情</th>
+                            </tr>
+                        </thead>
+                        <tbody id="audit-list"></tbody>
+                    </table>
+                    <div class="audit-pagination">
+                        <button id="audit-first-page-btn" class="btn btn-sm btn-outline" data-i18n="firstPage">首页</button>
+                        <button id="audit-prev-page-btn" class="btn btn-sm btn-outline" data-i18n="prevPage">上一页</button>
+                        <div id="audit-page-links" class="audit-page-links"></div>
+                        <span id="audit-page-info"></span>
+                        <button id="audit-next-page-btn" class="btn btn-sm btn-outline" data-i18n="nextPage">下一页</button>
+                        <button id="audit-last-page-btn" class="btn btn-sm btn-outline" data-i18n="lastPage">末页</button>
+                        <div class="audit-page-jump">
+                            <span data-i18n="jumpTo">跳转</span>
+                            <input id="audit-jump-page-input" type="number" min="1" value="1">
+                            <button id="audit-jump-page-btn" class="btn btn-sm btn-outline">GO</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="card">
+                    <h3 data-i18n="exportDataset">导出训练数据集</h3>
+                    <div class="filter-bar audit-export-bar">
+                        <label data-i18n="exportFormat">导出格式：</label>
+                        <select id="audit-export-format">
+                            <option value="openai_jsonl">OpenAI JSONL</option>
+                            <option value="sharegpt_json">ShareGPT JSON</option>
+                            <option value="query_response_jsonl">Query-Response JSONL</option>
+                            <option value="alpaca_json">Alpaca JSON</option>
+                        </select>
+                        <button id="audit-export-btn" class="btn btn-sm btn-outline" data-i18n="exportCurrentResult">导出当前查询结果</button>
+                    </div>
+                </div>
+            </div>
+
+            <div id="settings-page" class="page hidden">
+                <div class="page-header">
+                    <h1 data-i18n="personalSettingsTitle">个人设置</h1>
+                </div>
+                <div class="card">
+                    <h2 data-i18n="changePassword">修改密码</h2>
+                    <form id="change-password-form">
+                        <div class="form-group">
+                            <label data-i18n="currentPassword">当前密码</label>
+                            <input type="password" id="current-password" name="current_password" required>
+                        </div>
+                        <div class="form-group">
+                            <label data-i18n="newPassword">新密码</label>
+                            <input type="password" id="new-password" name="new_password" required>
+                        </div>
+                        <div class="form-group">
+                            <label data-i18n="confirmNewPassword">确认新密码</label>
+                            <input type="password" id="confirm-password" name="confirm_password" required>
+                        </div>
+                        <button type="submit" class="btn btn-primary" data-i18n="changePassword">修改密码</button>
+                    </form>
+                </div>
+                
+                <div id="system-settings-section" class="card hidden">
+                    <h2 data-i18n="systemSettings">系统设置</h2>
+                    <form id="system-settings-form">
+                        <div class="form-group">
+                            <label data-i18n="externalAccessUrl">外部访问地址 (Base URL)</label>
+                            <input type="url" id="system-base-url" name="base_url" placeholder="https://api.example.com/v1" required>
+                            <small data-i18n="externalAccessUrlHint">用户获取 API 调用示例时使用的外部地址</small>
+                        </div>
+                        <button type="submit" class="btn btn-primary" data-i18n="saveSettings">保存设置</button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="modal" class="modal hidden">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2 id="modal-title"></h2>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div id="modal-body" class="modal-body"></div>
+        </div>
+    </div>
+
+    <script src="/static/js/i18n.js"></script>
+    <script src="/static/js/echarts.min.js"></script>
+    <script src="/static/js/app.js?v=20260421-i18n"></script>
+</body>
+</html>

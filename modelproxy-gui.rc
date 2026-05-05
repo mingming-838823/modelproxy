@@ -1,0 +1,25 @@
+1 ICON "assets/icon.ico"
+
+VS_VERSION_INFO VERSIONINFO
+    FILEVERSION 0,1,0,0
+    PRODUCTVERSION 0,1,0,0
+    FILEFLAGSMASK 0x3f
+    FILEFLAGS 0
+    FILEOS 0x40004
+    FILETYPE 0x1
+    FILESUBTYPE 0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904E4"
+        BEGIN
+            VALUE "CompanyName", "ModelProxy"
+            VALUE "FileDescription", "ModelProxy - AI API Proxy Server"
+            VALUE "FileVersion", "0.1.0"
+            VALUE "InternalName", "modelproxy-gui"
+            VALUE "OriginalFilename", "modelproxy-gui.exe"
+            VALUE "ProductName", "ModelProxy"
+            VALUE "ProductVersion", "0.1.0"
+        END
+    END
+END
