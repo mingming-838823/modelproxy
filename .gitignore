@@ -50,3 +50,5 @@ desktop.ini
 .cargo-ok
 .rustc_info.json
 CACHEDIR.TAG
+
+request_flow.drawio
