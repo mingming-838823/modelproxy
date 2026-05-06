@@ -1,6 +1,6 @@
 [package]
 name = "modelproxy"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-3.0"
 
@@ -34,7 +34,7 @@ chrono = { version = "0.4", features = ["serde"] }
 jsonwebtoken = "9"
 bcrypt = "0.15"
 
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "http2", "native-tls"] }
 futures = "0.3"
 tokio-stream = "0.1"
 

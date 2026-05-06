@@ -334,6 +334,7 @@ async fn enrich_proxy_log(
     log: ProxyLogRecord,
     username_cache: &mut HashMap<Uuid, Option<String>>,
     model_cache: &mut HashMap<String, (Option<String>, String)>,
+    load_content: bool,
 ) -> EnrichedProxyLog {
     let user_id: Uuid = log.user_id.into();
     let username = if let Some(cached) = username_cache.get(&user_id) {
@@ -352,10 +353,14 @@ async fn enrich_proxy_log(
         value
     };
 
-    let content = if let Some(ref log_file) = log.log_file {
-        if let Some(ref writer) = state.store.get_proxy_log_writer() {
-            let log_id: Uuid = log.id.into();
-            writer.read_content(log_file, log_id).ok().flatten()
+    let content = if load_content {
+        if let Some(ref log_file) = log.log_file {
+            if let Some(ref writer) = state.store.get_proxy_log_writer() {
+                let log_id: Uuid = log.id.into();
+                writer.read_content(log_file, log_id).ok().flatten()
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -426,7 +431,7 @@ async fn scan_filtered_proxy_logs(
 
         for log in batch.iter().cloned() {
             let enriched =
-                enrich_proxy_log(state, log, &mut username_cache, &mut model_cache).await;
+                enrich_proxy_log(state, log, &mut username_cache, &mut model_cache, true).await;
 
             if let Some(ref user_filter) = username_filter {
                 let candidate = enriched.username.clone().unwrap_or_default().to_lowercase();
@@ -591,7 +596,7 @@ pub async fn list_proxy_audit_logs(
     let mut username_cache: HashMap<Uuid, Option<String>> = HashMap::new();
     let mut model_cache: HashMap<String, (Option<String>, String)> = HashMap::new();
     for log in logs {
-        let enriched = enrich_proxy_log(&state, log, &mut username_cache, &mut model_cache).await;
+        let enriched = enrich_proxy_log(&state, log, &mut username_cache, &mut model_cache, false).await;
         let record = enriched.log;
         items.push(ProxyAuditLogItem {
             id: record.id,

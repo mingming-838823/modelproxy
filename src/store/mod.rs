@@ -895,6 +895,107 @@ impl StoreManager {
         Ok(out)
     }
 
+    pub fn create_pending_proxy_log(&self, log: ProxyLogRecord) -> Result<Uuid, AppError> {
+        let pool = self.pool.clone();
+        let log_id: Uuid = log.id.into();
+        tokio::spawn(async move {
+            let result = sqlx::query("INSERT INTO proxy_logs (id, tenant_id, user_id, api_key_id, conversation_id, model, routed_model, provider, input_tokens, output_tokens, total_tokens, status, error_message, log_file, client_ip, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+                .bind(log.id.to_string())
+                .bind(log.tenant_id.to_string())
+                .bind(log.user_id.to_string())
+                .bind(log.api_key_id.to_string())
+                .bind(log.conversation_id)
+                .bind(log.model)
+                .bind(log.routed_model)
+                .bind(log.provider)
+                .bind(log.input_tokens)
+                .bind(log.output_tokens)
+                .bind(log.total_tokens)
+                .bind(log.status)
+                .bind(log.error_message)
+                .bind(&log.log_file)
+                .bind(log.client_ip)
+                .bind(log.created_at.to_rfc3339())
+                .execute(&pool)
+                .await;
+            if let Err(e) = result {
+                tracing::error!("Failed to create pending proxy log {}: {}", log_id, e);
+            }
+        });
+        Ok(log_id)
+    }
+
+    pub fn update_proxy_log_status(&self, log_id: Uuid, status: String, error_message: Option<String>) {
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            let result = if let Some(ref msg) = error_message {
+                sqlx::query("UPDATE proxy_logs SET status = ?, error_message = ? WHERE id = ?")
+                    .bind(&status)
+                    .bind(msg)
+                    .bind(log_id.to_string())
+                    .execute(&pool)
+                    .await
+            } else {
+                sqlx::query("UPDATE proxy_logs SET status = ?, error_message = NULL WHERE id = ?")
+                    .bind(&status)
+                    .bind(log_id.to_string())
+                    .execute(&pool)
+                    .await
+            };
+            if let Err(e) = result {
+                tracing::error!("Failed to update proxy log status {}: {}", log_id, e);
+            }
+        });
+    }
+
+    pub fn update_proxy_log_with_content(&self, log_id: Uuid, status: String, error_message: Option<String>, input_tokens: i64, output_tokens: i64, total_tokens: i64, routed_model: Option<String>, provider: String, content: ProxyLogContent) {
+        let pool = self.pool.clone();
+        let writer = self.proxy_log_writer.clone();
+        tokio::spawn(async move {
+            let log_file = if let Some(ref w) = writer {
+                match w.write_content(&content).await {
+                    Ok(filename) => Some(filename),
+                    Err(e) => {
+                        tracing::error!("Failed to write proxy log content to file {}: {}", log_id, e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let result = if let Some(ref msg) = error_message {
+                sqlx::query("UPDATE proxy_logs SET status = ?, error_message = ?, input_tokens = ?, output_tokens = ?, total_tokens = ?, routed_model = ?, provider = ?, log_file = ? WHERE id = ?")
+                    .bind(&status)
+                    .bind(msg)
+                    .bind(input_tokens)
+                    .bind(output_tokens)
+                    .bind(total_tokens)
+                    .bind(&routed_model)
+                    .bind(&provider)
+                    .bind(&log_file)
+                    .bind(log_id.to_string())
+                    .execute(&pool)
+                    .await
+            } else {
+                sqlx::query("UPDATE proxy_logs SET status = ?, error_message = NULL, input_tokens = ?, output_tokens = ?, total_tokens = ?, routed_model = ?, provider = ?, log_file = ? WHERE id = ?")
+                    .bind(&status)
+                    .bind(input_tokens)
+                    .bind(output_tokens)
+                    .bind(total_tokens)
+                    .bind(&routed_model)
+                    .bind(&provider)
+                    .bind(&log_file)
+                    .bind(log_id.to_string())
+                    .execute(&pool)
+                    .await
+            };
+            if let Err(e) = result {
+                tracing::error!("Failed to update proxy log with content {}: {}", log_id, e);
+            }
+        });
+    }
+
     pub async fn list_proxy_logs_filtered(
         &self,
         tenant_id: Option<Uuid>,
@@ -1473,7 +1574,25 @@ impl StoreManager {
         }
 
         let mut fallback: Option<(Uuid, String)> = None;
-        for route in routes {
+        for route in &routes {
+            if !route.is_fallback {
+                continue;
+            }
+            if !route.is_visible_to(user_id) {
+                continue;
+            }
+            let has_access = self
+                .check_model_access(user_id, route.upstream_id, &route.model_name)
+                .await;
+            if has_access {
+                fallback = Some((route.upstream_id, route.model_name.clone()));
+            }
+        }
+
+        for route in &routes {
+            if route.is_fallback {
+                continue;
+            }
             if !route.is_visible_to(user_id) {
                 continue;
             }
@@ -1484,17 +1603,12 @@ impl StoreManager {
                 continue;
             }
 
-            if route.is_fallback {
-                fallback = Some((route.upstream_id, route.model_name.clone()));
-                continue;
-            }
-
             if route.matches(request_text, estimated_input_tokens, request_has_image) {
                 let mut out = vec![(route.upstream_id, route.model_name.clone())];
-                if let Some(fallback_route) = fallback {
+                if let Some(ref fallback_route) = fallback {
                     if fallback_route.0 != route.upstream_id || fallback_route.1 != route.model_name
                     {
-                        out.push(fallback_route);
+                        out.push(fallback_route.clone());
                     }
                 }
                 return out;

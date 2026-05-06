@@ -294,6 +294,34 @@ pub async fn proxy_handler(
         return Err(e);
     }
 
+    let pending_proxy_log_id = {
+        let pending_log = ProxyLogRecord {
+            id: SqlUuid::new_v4(),
+            tenant_id: SqlUuid::from(conversation.tenant_id),
+            user_id: SqlUuid::from(conversation.user_id),
+            api_key_id: SqlUuid::from(api_key.id),
+            conversation_id: Some(conversation.conversation_id.clone()),
+            model: conversation.model.clone(),
+            routed_model: None,
+            provider: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            status: "pending".to_string(),
+            error_message: None,
+            log_file: None,
+            client_ip: conversation.client_ip.clone(),
+            created_at: Utc::now(),
+        };
+        match state.store.create_pending_proxy_log(pending_log) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!("Failed to create pending proxy log: {}", e);
+                None
+            }
+        }
+    };
+
     let mut last_error = None;
     let mut tried_upstream_ids: Vec<Uuid> = Vec::new();
     let mut last_provider = String::new();
@@ -396,6 +424,7 @@ pub async fn proxy_handler(
 
                     if status == StatusCode::TOO_MANY_REQUESTS {
                         let error_body = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                        tracing::info!("Upstream '{}' model='{}' attempt {}/{} returned 429", upstream.name, routed_model, attempt + 1, max_attempts);
                         let reason = "Rate limit exceeded from upstream".to_string();
                         state.blocker.block_upstream(upstream.id, reason);
                         let error_message = format!("Upstream rate limit: {} - {}", status, error_body);
@@ -408,6 +437,7 @@ pub async fn proxy_handler(
 
                     if status.is_client_error() || status.is_server_error() {
                         let error_body = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                        tracing::info!("Upstream '{}' model='{}' attempt {}/{} returned {}", upstream.name, routed_model, attempt + 1, max_attempts, status.as_u16());
 
                         if is_rate_limit_error(&error_body, status) {
                             let reason = format!("Rate limit error: {}", error_body);
@@ -423,11 +453,10 @@ pub async fn proxy_handler(
                         let error_message = format!("Upstream error: {} - {}", status, error_body);
                         log_upstream_error(&state.error_logger, &upstream.base_url, routed_model, &error_message, Some(status.as_u16())).await;
                         last_error = Some(AppError::Internal(error_message));
-                        if status.is_server_error() || status == StatusCode::FORBIDDEN {
-                            continue 'retry;
-                        }
-                        break 'retry;
+                        continue 'retry;
                     }
+
+                    tracing::info!("Upstream '{}' model='{}' attempt {}/{} returned {}", upstream.name, routed_model, attempt + 1, max_attempts, status.as_u16());
 
                     if is_stream {
                         return handle_stream_response(
@@ -435,6 +464,7 @@ pub async fn proxy_handler(
                             is_ollama, is_anthropic, model.to_string(), routed_model.to_string(),
                             upstream.provider.clone(),
                             request_body_str, messages,
+                            pending_proxy_log_id,
                         ).await;
                     } else {
                         match handle_normal_response(
@@ -442,6 +472,7 @@ pub async fn proxy_handler(
                             is_ollama, is_anthropic, model.to_string(), routed_model.to_string(),
                             upstream.provider.clone(),
                             request_body_str.clone(), messages.clone(),
+                            pending_proxy_log_id,
                         ).await {
                             Ok(resp) => return Ok(resp),
                             Err(e) => {
@@ -454,6 +485,7 @@ pub async fn proxy_handler(
                     }
                 }
                 Err(e) => {
+                    tracing::info!("Upstream '{}' model='{}' attempt {}/{} connection failed: {}", upstream.name, routed_model, attempt + 1, max_attempts, e);
                     let error_msg = e.to_string().to_lowercase();
                     if error_msg.contains("rate limit") || error_msg.contains("too many") || error_msg.contains("429") {
                         let reason = format!("Connection error with rate limit: {}", e);
@@ -518,11 +550,26 @@ pub async fn proxy_handler(
     let messages = extract_messages_from_request(&body);
     let error_message = last_error.as_ref().map(|e| e.to_string()).unwrap_or_default();
 
-    let _ = write_failed_proxy_log(
-        &state.store, &conversation, api_key.id,
-        Some(last_routed_model), last_provider.clone(), request_body_str, messages,
-        error_message, None,
-    );
+    if let Some(log_id) = pending_proxy_log_id {
+        let content = ProxyLogContent {
+            id: log_id.into(),
+            request_body: request_body_str.clone(),
+            response_body: None,
+            messages,
+        };
+        state.store.update_proxy_log_with_content(
+            log_id, "failed".to_string(), Some(error_message.clone()),
+            0, 0, 0,
+            Some(last_routed_model.clone()), last_provider.clone(),
+            content,
+        );
+    } else {
+        let _ = write_failed_proxy_log(
+            &state.store, &conversation, api_key.id,
+            Some(last_routed_model), last_provider.clone(), request_body_str, messages,
+            error_message, None,
+        );
+    }
 
     let _ = state.store.update_conversation(
         conversation.id,
@@ -812,6 +859,7 @@ async fn handle_normal_response(
     provider: String,
     request_body_str: Option<String>,
     messages: Vec<MessageRecord>,
+    pending_proxy_log_id: Option<Uuid>,
 ) -> AppResult<Response> {
     let status = response.status();
     let body = response
@@ -933,31 +981,46 @@ async fn handle_normal_response(
             });
         }
 
-        let proxy_log = ProxyLogRecord {
-            id: SqlUuid::new_v4(),
-            tenant_id: SqlUuid::from(conversation.tenant_id),
-            user_id: SqlUuid::from(conversation.user_id),
-            api_key_id: SqlUuid::from(api_key_id),
-            conversation_id: Some(conversation.conversation_id.clone()),
-            model: conversation.model.clone(),
-            routed_model: Some(routed_model),
-            provider: provider.clone(),
-            input_tokens: usage.prompt_tokens as i64,
-            output_tokens: usage.completion_tokens as i64,
-            total_tokens: tokens,
-            status: "success".to_string(),
-            error_message: None,
-            log_file: None,
-            client_ip: conversation.client_ip.clone(),
-            created_at: Utc::now(),
-        };
-        let content = ProxyLogContent {
-            id: proxy_log.id.into(),
-            request_body: request_body_str,
-            response_body: Some(response_body.clone()),
-            messages: all_messages,
-        };
-        state.store.write_proxy_log(proxy_log, content)?;
+        if let Some(log_id) = pending_proxy_log_id {
+            let content = ProxyLogContent {
+                id: log_id.into(),
+                request_body: request_body_str,
+                response_body: Some(response_body.clone()),
+                messages: all_messages,
+            };
+            state.store.update_proxy_log_with_content(
+                log_id, "success".to_string(), None,
+                usage.prompt_tokens as i64, usage.completion_tokens as i64, tokens,
+                Some(routed_model), provider.clone(),
+                content,
+            );
+        } else {
+            let proxy_log = ProxyLogRecord {
+                id: SqlUuid::new_v4(),
+                tenant_id: SqlUuid::from(conversation.tenant_id),
+                user_id: SqlUuid::from(conversation.user_id),
+                api_key_id: SqlUuid::from(api_key_id),
+                conversation_id: Some(conversation.conversation_id.clone()),
+                model: conversation.model.clone(),
+                routed_model: Some(routed_model),
+                provider: provider.clone(),
+                input_tokens: usage.prompt_tokens as i64,
+                output_tokens: usage.completion_tokens as i64,
+                total_tokens: tokens,
+                status: "success".to_string(),
+                error_message: None,
+                log_file: None,
+                client_ip: conversation.client_ip.clone(),
+                created_at: Utc::now(),
+            };
+            let content = ProxyLogContent {
+                id: proxy_log.id.into(),
+                request_body: None,
+                response_body: None,
+                messages: Vec::new(),
+            };
+            state.store.write_proxy_log(proxy_log, content)?;
+        }
     } else {
         let _ = state
             .store
@@ -981,31 +1044,46 @@ async fn handle_normal_response(
             });
         }
 
-        let proxy_log = ProxyLogRecord {
-            id: SqlUuid::new_v4(),
-            tenant_id: SqlUuid::from(conversation.tenant_id),
-            user_id: SqlUuid::from(conversation.user_id),
-            api_key_id: SqlUuid::from(api_key_id),
-            conversation_id: Some(conversation.conversation_id.clone()),
-            model: conversation.model.clone(),
-            routed_model: Some(routed_model),
-            provider: provider.clone(),
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
-            status: "success".to_string(),
-            error_message: Some("No usage data from upstream".to_string()),
-            log_file: None,
-            client_ip: conversation.client_ip.clone(),
-            created_at: Utc::now(),
-        };
-        let content = ProxyLogContent {
-            id: proxy_log.id.into(),
-            request_body: request_body_str,
-            response_body: Some(response_body.clone()),
-            messages: all_messages,
-        };
-        state.store.write_proxy_log(proxy_log, content)?;
+        if let Some(log_id) = pending_proxy_log_id {
+            let content = ProxyLogContent {
+                id: log_id.into(),
+                request_body: request_body_str,
+                response_body: Some(response_body.clone()),
+                messages: all_messages,
+            };
+            state.store.update_proxy_log_with_content(
+                log_id, "success".to_string(), Some("No usage data from upstream".to_string()),
+                0, 0, 0,
+                Some(routed_model), provider.clone(),
+                content,
+            );
+        } else {
+            let proxy_log = ProxyLogRecord {
+                id: SqlUuid::new_v4(),
+                tenant_id: SqlUuid::from(conversation.tenant_id),
+                user_id: SqlUuid::from(conversation.user_id),
+                api_key_id: SqlUuid::from(api_key_id),
+                conversation_id: Some(conversation.conversation_id.clone()),
+                model: conversation.model.clone(),
+                routed_model: Some(routed_model),
+                provider: provider.clone(),
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                status: "success".to_string(),
+                error_message: Some("No usage data from upstream".to_string()),
+                log_file: None,
+                client_ip: conversation.client_ip.clone(),
+                created_at: Utc::now(),
+            };
+            let content = ProxyLogContent {
+                id: proxy_log.id.into(),
+                request_body: None,
+                response_body: None,
+                messages: Vec::new(),
+            };
+            state.store.write_proxy_log(proxy_log, content)?;
+        }
     }
 
     Ok(Response::builder()
@@ -1194,6 +1272,7 @@ async fn handle_stream_response(
     provider: String,
     request_body_str: Option<String>,
     messages: Vec<MessageRecord>,
+    pending_proxy_log_id: Option<Uuid>,
 ) -> AppResult<Response> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, axum::Error>>(100);
 
@@ -1516,32 +1595,46 @@ async fn handle_stream_response(
             Some(full_response.to_string())
         };
 
-        // 写入合并的代理日志（包含会话和日志信息）
-        let proxy_log = ProxyLogRecord {
-            id: SqlUuid::new_v4(),
-            tenant_id: SqlUuid::from(tenant_id),
-            user_id: SqlUuid::from(user_id),
-            api_key_id: SqlUuid::from(api_key_id),
-            conversation_id: Some(conversation_id.to_string()),
-            model: model_clone.clone(),
-            routed_model: Some(routed_model_clone.clone()),
-            provider,
-            input_tokens: total_input_tokens,
-            output_tokens: total_output_tokens,
-            total_tokens,
-            status,
-            error_message: failed_reason,
-            log_file: None,
-            client_ip,
-            created_at: Utc::now(),
-        };
-        let content = ProxyLogContent {
-            id: proxy_log.id.into(),
-            request_body: request_body_str,
-            response_body,
-            messages: all_messages,
-        };
-        let _ = store.write_proxy_log(proxy_log, content);
+        if let Some(log_id) = pending_proxy_log_id {
+            let content = ProxyLogContent {
+                id: log_id.into(),
+                request_body: request_body_str,
+                response_body,
+                messages: all_messages,
+            };
+            store.update_proxy_log_with_content(
+                log_id, status, failed_reason,
+                total_input_tokens, total_output_tokens, total_tokens,
+                Some(routed_model_clone.clone()), provider,
+                content,
+            );
+        } else {
+            let proxy_log = ProxyLogRecord {
+                id: SqlUuid::new_v4(),
+                tenant_id: SqlUuid::from(tenant_id),
+                user_id: SqlUuid::from(user_id),
+                api_key_id: SqlUuid::from(api_key_id),
+                conversation_id: Some(conversation_id.to_string()),
+                model: model_clone.clone(),
+                routed_model: Some(routed_model_clone.clone()),
+                provider,
+                input_tokens: total_input_tokens,
+                output_tokens: total_output_tokens,
+                total_tokens,
+                status,
+                error_message: failed_reason,
+                log_file: None,
+                client_ip,
+                created_at: Utc::now(),
+            };
+            let content = ProxyLogContent {
+                id: proxy_log.id.into(),
+                request_body: None,
+                response_body: None,
+                messages: Vec::new(),
+            };
+            let _ = store.write_proxy_log(proxy_log, content);
+        }
     });
 
     let stream = ReceiverStream::new(rx);

@@ -922,6 +922,17 @@ function formatModelAliasWithOriginal(modelName, modelAlias, originalModelName, 
     return `<code>${alias}</code><div style="color:#1677ff;font-size:12px;"><code style="color:#1677ff;">${original}</code></div><div style="color:#52c41a;font-size:12px;">${t('actualModel')}: <code style="color:#52c41a;">${routedModel}</code></div>`;
 }
 
+function formatAuditStatus(status) {
+    if (!status) return '-';
+    const statusMap = {
+        'pending': { color: '#faad14', bg: '#fffbe6', text: 'Pending' },
+        'success': { color: '#52c41a', bg: '#f6ffed', text: 'Success' },
+        'failed': { color: '#ff4d4f', bg: '#fff2f0', text: 'Failed' },
+    };
+    const s = statusMap[status] || { color: '#999', bg: '#f5f5f5', text: status };
+    return `<span style="display:inline-block;padding:2px 8px;border-radius:4px;font-size:12px;font-weight:500;color:${s.color};background:${s.bg};">${s.text}</span>`;
+}
+
 async function loadMyModels() {
     try {
         const data = await api('/models/my');
@@ -3354,7 +3365,7 @@ async function loadAuditLogs() {
                 <td>${formatServerDateTime(log.created_at)}</td>
                 <td>${log.username || '-'}</td>
                 <td>${formatModelAliasWithOriginal(log.model, log.model_alias, log.original_model_name, log.routed_model)}</td>
-                <td>${log.status || '-'}</td>
+                <td>${formatAuditStatus(log.status)}</td>
                 <td>${(log.total_tokens || 0).toLocaleString()}</td>
                 <td>${log.client_ip || '-'}</td>
                 <td>
@@ -3483,7 +3494,7 @@ async function viewAuditDetails(id) {
                 <div class="audit-summary-grid">
                     <div class="audit-summary-card"><div class="audit-summary-label">${t('time')}</div><div class="audit-summary-value">${formatServerDateTime(log.created_at)}</div></div>
                     <div class="audit-summary-card"><div class="audit-summary-label">${t('user')}</div><div class="audit-summary-value">${escapeHtml(log.username || '-')}</div></div>
-                    <div class="audit-summary-card"><div class="audit-summary-label">${t('status')}</div><div class="audit-summary-value">${escapeHtml(log.status || '-')}</div></div>
+                    <div class="audit-summary-card"><div class="audit-summary-label">${t('status')}</div><div class="audit-summary-value">${formatAuditStatus(log.status)}</div></div>
                     <div class="audit-summary-card"><div class="audit-summary-label">Token</div><div class="audit-summary-value">${Number(log.total_tokens || 0).toLocaleString()}</div></div>
                     <div class="audit-summary-card"><div class="audit-summary-label">IP</div><div class="audit-summary-value">${escapeHtml(log.client_ip || '-')}</div></div>
                     <div class="audit-summary-card"><div class="audit-summary-label">${t('conversationId')}</div><div class="audit-summary-value audit-mono-text">${escapeHtml(log.conversation_id || '-')}</div></div>

@@ -580,7 +580,7 @@ impl ModelProxy {
             text(filtered_lines)
                 .font(font::Font::MONOSPACE)
                 .size(12)
-                .color(Color::from_rgb(0.8, 0.8, 0.8))
+                .color(Color::from_rgb(0.55, 0.55, 0.55))
                 .width(Length::Fill),
         )
         .anchor_bottom();

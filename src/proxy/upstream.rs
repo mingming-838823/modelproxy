@@ -130,6 +130,7 @@ impl UpstreamClient {
             .timeout(Duration::from_secs(config.request_timeout_secs))
             .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
             .pool_max_idle_per_host(config.max_idle_connections)
+            .no_proxy()
             .build()
             .map_err(|e| AppError::Internal(format!("Failed to create HTTP client: {}", e)))?;
 
