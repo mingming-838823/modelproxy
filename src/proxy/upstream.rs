@@ -216,6 +216,8 @@ impl UpstreamClient {
             request = request.json(&body);
         }
 
+        request = request.header("Accept-Encoding", "identity");
+
         let response = request.send().await?;
 
         Ok(response)

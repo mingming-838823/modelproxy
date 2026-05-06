@@ -220,10 +220,6 @@ pub async fn proxy_handler(
                 tracing::debug!("Skipping conditional route upstream '{}' (status={})", upstream.name, upstream.status);
                 continue;
             }
-            if state.blocker.is_blocked(upstream.id) {
-                tracing::debug!("Skipping conditional route upstream '{}' (blocked)", upstream.name);
-                continue;
-            }
             let vis = state
                 .store
                 .get_model_visibility(upstream.id, &routed_model)
@@ -236,9 +232,6 @@ pub async fn proxy_handler(
     let upstreams_list = state.store.get_upstreams_by_tenant(api_key.tenant_id).await;
     for u in upstreams_list {
         if u.status != "active" {
-            continue;
-        }
-        if state.blocker.is_blocked(u.id) {
             continue;
         }
         if used_upstream_ids.contains(&u.id) {
@@ -425,8 +418,6 @@ pub async fn proxy_handler(
                     if status == StatusCode::TOO_MANY_REQUESTS {
                         let error_body = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
                         tracing::info!("Upstream '{}' model='{}' attempt {}/{} returned 429", upstream.name, routed_model, attempt + 1, max_attempts);
-                        let reason = "Rate limit exceeded from upstream".to_string();
-                        state.blocker.block_upstream(upstream.id, reason);
                         let error_message = format!("Upstream rate limit: {} - {}", status, error_body);
                         log_upstream_error(&state.error_logger, &upstream.base_url, routed_model, &error_message, Some(status.as_u16())).await;
                         last_error = Some(AppError::RateLimitExceeded(
@@ -440,8 +431,6 @@ pub async fn proxy_handler(
                         tracing::info!("Upstream '{}' model='{}' attempt {}/{} returned {}", upstream.name, routed_model, attempt + 1, max_attempts, status.as_u16());
 
                         if is_rate_limit_error(&error_body, status) {
-                            let reason = format!("Rate limit error: {}", error_body);
-                            state.blocker.block_upstream(upstream.id, reason);
                             let error_message = format!("Upstream rate limit: {} - {}", status, error_body);
                             log_upstream_error(&state.error_logger, &upstream.base_url, routed_model, &error_message, Some(status.as_u16())).await;
                             last_error = Some(AppError::RateLimitExceeded(
@@ -488,8 +477,6 @@ pub async fn proxy_handler(
                     tracing::info!("Upstream '{}' model='{}' attempt {}/{} connection failed: {}", upstream.name, routed_model, attempt + 1, max_attempts, e);
                     let error_msg = e.to_string().to_lowercase();
                     if error_msg.contains("rate limit") || error_msg.contains("too many") || error_msg.contains("429") {
-                        let reason = format!("Connection error with rate limit: {}", e);
-                        state.blocker.block_upstream(upstream.id, reason);
                         let error_message = format!("Upstream request failed: {}", e);
                         log_upstream_error(&state.error_logger, &upstream.base_url, routed_model, &error_message, Some(429)).await;
                         last_error = Some(AppError::RateLimitExceeded(
@@ -515,7 +502,7 @@ pub async fn proxy_handler(
         if current_retry_failure_strategy == "route" {
             if let Some(fallback_upstream_id) = current_retry_fallback_upstream_id {
                 if let Some(fallback_upstream) = state.store.get_upstream(fallback_upstream_id).await {
-                    if fallback_upstream.status == "active" && !state.blocker.is_blocked(fallback_upstream.id) {
+                    if fallback_upstream.status == "active" {
                         let fallback_model = current_retry_fallback_model_name.as_deref().unwrap_or(model);
                         if state.store.check_model_access(api_key.user_id, fallback_upstream_id, fallback_model).await {
                             if !tried_upstream_ids.contains(&fallback_upstream_id) {
@@ -533,7 +520,7 @@ pub async fn proxy_handler(
                             tracing::warn!("Fallback upstream '{}' model '{}' access denied for user {}", fallback_upstream.name, fallback_model, user.username);
                         }
                     } else {
-                        tracing::warn!("Fallback upstream '{}' is not available (status={}, blocked={})", fallback_upstream.name, fallback_upstream.status, state.blocker.is_blocked(fallback_upstream.id));
+                        tracing::warn!("Fallback upstream '{}' is not available (status={})", fallback_upstream.name, fallback_upstream.status);
                     }
                 } else {
                     tracing::warn!("Fallback upstream {} not found in cache", fallback_upstream_id);
