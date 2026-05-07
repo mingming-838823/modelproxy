@@ -46,7 +46,7 @@ use crate::store::{AdminState, StoreManager};
 use crate::utils::secrets::is_insecure_default_jwt_secret;
 
 static EMBEDDED_STATIC_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/static");
-const APP_VERSION: &str = "1.0.01";
+const APP_VERSION: &str = "0.1.2";
 
 #[derive(Debug, Clone, Copy)]
 enum MaintenanceCommand {
@@ -164,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/models", get(proxy::handlers::list_models))
         .route("/chat/completions", post(proxy_handler))
         .route("/completions", post(proxy_handler))
-        .route("/messages", post(proxy_handler))
+        .route("/messages", post(proxy::handlers::anthropic_proxy_handler))
         .with_state(proxy_state);
 
     let proxy_app = Router::new()

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::path::PathBuf;
 
 use axum::{
     extract::{ConnectInfo, Request, State},
@@ -19,12 +20,9 @@ use crate::{
         error_log::UpstreamErrorLogger,
         rate_limiter::{RateLimiter, UpstreamRateLimitConfig, UpstreamRateLimiter},
         upstream::{
-            convert_anthropic_stream_to_openai, convert_anthropic_to_openai_response,
-            convert_ollama_stream_to_openai, convert_ollama_to_openai_response,
-            convert_openai_to_anthropic_request, convert_openai_to_ollama_request,
             estimate_tokens_by_rules,
-            ChatCompletionRequest, ChatCompletionResponse, LoadBalancer, OllamaChatResponse,
-            OllamaStreamChunk, UpstreamClient, Usage,
+            ChatCompletionResponse, LoadBalancer,
+            UpstreamClient, Usage,
         },
     },
     store::{ConversationRecord, ConversationUpdate, MessageRecord, ProxyLogContent, ProxyLogRecord, StoreManager},
@@ -77,6 +75,504 @@ pub async fn list_models(
     };
 
     Ok(axum::Json(response).into_response())
+}
+
+pub async fn anthropic_proxy_handler(
+    State(state): State<ProxyState>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    request: Request,
+) -> AppResult<Response> {
+    let path = request.uri().path().to_string();
+    let method = request.method().clone();
+    tracing::info!("Anthropic proxy request: {} {} from {}", method, path, addr);
+
+    let api_key_str = if let Some(x_api_key) = request
+        .headers()
+        .get("x-api-key")
+        .and_then(|h| h.to_str().ok())
+    {
+        x_api_key.to_string()
+    } else if let Some(auth_header) = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+    {
+        auth_header
+            .strip_prefix("Bearer ")
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                tracing::warn!("Anthropic proxy request rejected: invalid authorization format from {}", addr);
+                AppError::Unauthorized("Invalid authorization format".to_string())
+            })?
+    } else {
+        tracing::warn!("Anthropic proxy request rejected: missing authentication header from {}", addr);
+        return Err(AppError::Unauthorized("Missing authentication header (x-api-key or Authorization)".to_string()));
+    };
+
+    let api_key = state.store.verify_api_key(&api_key_str).await.map_err(|e| {
+        tracing::warn!("Anthropic proxy request rejected: API key verification failed from {} - {}", addr, e);
+        e
+    })?;
+
+    let user = state
+        .store
+        .get_user(api_key.user_id)
+        .await
+        .ok_or_else(|| {
+            tracing::error!("User not found for API key {}", api_key.id);
+            AppError::NotFound("User not found".to_string())
+        })?;
+
+    let rate_config = crate::proxy::rate_limiter::RateLimitConfig {
+        rpm_limit: api_key.rpm_limit,
+        tpm_limit: api_key.tpm_limit,
+        daily_limit: api_key.daily_limit as i64,
+    };
+
+    state
+        .rate_limiter
+        .check_rate_limit(api_key.id, &rate_config)
+        .map_err(|e| {
+            tracing::warn!("Rate limit exceeded for user {}: {}", user.username, e);
+            AppError::RateLimitExceeded(e)
+        })?;
+
+    state.store.check_user_request_quota(&user).await.map_err(|e| {
+        tracing::warn!("User {} quota exceeded: {}", user.username, e);
+        e
+    })?;
+
+    let incoming_headers = request.headers().clone();
+
+    let hard_limit = state.config.max_request_body_bytes;
+    let body_bytes = axum::body::to_bytes(request.into_body(), hard_limit)
+        .await
+        .map_err(|e| {
+            let message = e.to_string();
+            if message.contains("length limit exceeded") {
+                return AppError::PayloadTooLarge(format!(
+                    "Request body exceeds hard limit: {} bytes",
+                    hard_limit
+                ));
+            }
+            AppError::Internal(format!("Failed to read body: {}", message))
+        })?;
+
+    let body: Option<Value> = if body_bytes.is_empty() {
+        None
+    } else {
+        serde_json::from_slice(&body_bytes)
+            .map_err(|e| AppError::BadRequest(format!("Invalid JSON body: {}", e)))?
+    };
+
+    let is_multimodal = is_multimodal_request(&body);
+    let configured_limit = if is_multimodal {
+        state.config.max_multimodal_request_body_bytes
+    } else {
+        state.config.max_text_request_body_bytes
+    };
+    let effective_limit = configured_limit.min(hard_limit);
+    if body_bytes.len() > effective_limit {
+        let mode = if is_multimodal { "multimodal" } else { "text" };
+        return Err(AppError::PayloadTooLarge(format!(
+            "Request body exceeds {} limit: {} bytes (current: {} bytes)",
+            mode,
+            effective_limit,
+            body_bytes.len()
+        )));
+    }
+
+    let is_stream = body
+        .as_ref()
+        .and_then(|b: &Value| b.get("stream").and_then(|s| s.as_bool()))
+        .unwrap_or(false);
+
+    let model = body
+        .as_ref()
+        .and_then(|b: &Value| b.get("model").and_then(|m| m.as_str()))
+        .unwrap_or("claude-3-sonnet");
+
+    tracing::info!(
+        "Anthropic proxy request details: model={}, stream={}, user={}, multimodal={}",
+        model, is_stream, user.username, is_multimodal
+    );
+
+    let mut available_upstreams: Vec<(crate::store::UpstreamCache, String, Option<crate::store::ModelVisibilityCache>)> =
+        Vec::new();
+    let mut used_upstream_ids: Vec<Uuid> = Vec::new();
+    let routing_text = extract_routing_text_from_anthropic_request(&body);
+    let estimated_input_tokens = estimate_input_tokens(&routing_text);
+    let conditional_routes = state
+        .store
+        .resolve_conditional_alias_routes(
+            api_key.user_id,
+            api_key.tenant_id,
+            model,
+            &routing_text,
+            estimated_input_tokens,
+            is_multimodal,
+        )
+        .await;
+
+    if !conditional_routes.is_empty() {
+        tracing::debug!("Model '{}' matched {} conditional route(s)", model, conditional_routes.len());
+        for (upstream_id, routed_model) in conditional_routes {
+            let Some(upstream) = state.store.get_upstream(upstream_id).await else {
+                tracing::warn!("Conditional route upstream {} not found in cache", upstream_id);
+                continue;
+            };
+            if upstream.status != "active" {
+                tracing::debug!("Skipping conditional route upstream '{}' (status={})", upstream.name, upstream.status);
+                continue;
+            }
+            let upstream_api_type = upstream.api_type.to_lowercase();
+            if upstream_api_type != "anthropic" {
+                tracing::debug!("Skipping non-Anthropic upstream '{}' for Anthropic client request", upstream.name);
+                continue;
+            }
+            let vis = state
+                .store
+                .get_model_visibility(upstream.id, &routed_model)
+                .await;
+            used_upstream_ids.push(upstream.id);
+            available_upstreams.push((upstream, routed_model, vis));
+        }
+    }
+
+    let upstreams_list = state.store.get_upstreams_by_tenant(api_key.tenant_id).await;
+    for u in upstreams_list {
+        if u.status != "active" {
+            continue;
+        }
+        if used_upstream_ids.contains(&u.id) {
+            continue;
+        }
+        let upstream_api_type = u.api_type.to_lowercase();
+        if upstream_api_type != "anthropic" {
+            continue;
+        }
+        if let Some(routed_model) = state
+            .store
+            .resolve_requested_model(api_key.user_id, u.id, model)
+            .await
+        {
+            tracing::debug!("Upstream '{}' resolved model '{}' -> '{}'", u.name, model, routed_model);
+            let vis = state
+                .store
+                .get_model_visibility(u.id, &routed_model)
+                .await;
+            available_upstreams.push((u, routed_model, vis));
+        }
+    }
+
+    if available_upstreams.is_empty() {
+        tracing::warn!(
+            "No active Anthropic upstream found for model='{}', user={}",
+            model, user.username
+        );
+        return Err(AppError::Forbidden(format!(
+            "No active Anthropic upstream found for model: {}",
+            model
+        )));
+    }
+
+    let conversation_id = Uuid::new_v4().to_string();
+    let client_ip = addr.ip().to_string();
+
+    let conversation_uuid = Uuid::new_v4();
+    let conversation = ConversationRecord {
+        id: conversation_uuid,
+        conversation_id: conversation_id.clone(),
+        tenant_id: api_key.tenant_id,
+        user_id: api_key.user_id,
+        api_key_id: api_key.id,
+        model: model.to_string(),
+        provider: String::new(),
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        status: Some(Utc::now()),
+        client_ip,
+        started_at: Utc::now(),
+        ended_at: None,
+    };
+
+    let _ = state.store.create_conversation(conversation.clone());
+
+    let pending_proxy_log_id = {
+        let pending_log = ProxyLogRecord {
+            id: SqlUuid::new_v4(),
+            tenant_id: SqlUuid::from(conversation.tenant_id),
+            user_id: SqlUuid::from(conversation.user_id),
+            api_key_id: SqlUuid::from(api_key.id),
+            conversation_id: Some(conversation.conversation_id.clone()),
+            model: conversation.model.clone(),
+            routed_model: None,
+            provider: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            status: "pending".to_string(),
+            error_message: None,
+            log_file: None,
+            client_ip: conversation.client_ip.clone(),
+            created_at: Utc::now(),
+        };
+        match state.store.create_pending_proxy_log(pending_log) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!("Failed to create pending proxy log: {}", e);
+                None
+            }
+        }
+    };
+
+    let mut last_error = None;
+    let mut tried_upstream_ids: Vec<Uuid> = Vec::new();
+    let mut last_provider = String::new();
+    let mut last_routed_model = String::new();
+    let mut upstream_idx = 0;
+
+    while upstream_idx < available_upstreams.len() {
+        let (upstream, routed_model, vis) = &available_upstreams[upstream_idx];
+        let upstream_id = upstream.id;
+        let routed_model_clone = routed_model.clone();
+        last_provider = upstream.provider.clone();
+        last_routed_model = routed_model.clone();
+
+        let model_headers = vis.as_ref()
+            .map(|v| v.model_headers.clone())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let retry_count = vis.as_ref().map(|v| v.retry_count).unwrap_or(0);
+        let retry_interval_ms = vis.as_ref().map(|v| v.retry_interval_seconds).unwrap_or(0);
+        let retry_backoff_strategy = vis.as_ref()
+            .map(|v| v.retry_backoff_strategy.as_str())
+            .unwrap_or("fixed");
+        let retry_max_interval_ms = vis.as_ref().map(|v| v.retry_max_interval_seconds).unwrap_or(0);
+        let current_retry_failure_strategy = vis.as_ref()
+            .map(|v| v.retry_failure_strategy.clone())
+            .unwrap_or_else(|| "error".to_string());
+        let current_retry_fallback_upstream_id = vis.as_ref().and_then(|v| v.retry_fallback_upstream_id);
+        let current_retry_fallback_model_name = vis.as_ref().and_then(|v| v.retry_fallback_model_name.clone());
+
+        tracing::info!(
+            "Trying Anthropic upstream '{}' model='{}': retries={}, fallback_upstream={:?}, fallback_model={:?}",
+            upstream.name, routed_model, retry_count,
+            current_retry_fallback_upstream_id, current_retry_fallback_model_name
+        );
+
+        let max_attempts = if retry_count > 0 { retry_count as usize + 1 } else { 1 };
+
+        'retry: for attempt in 0..max_attempts {
+            if attempt > 0 {
+                let delay_ms = calculate_retry_delay(
+                    attempt,
+                    retry_interval_ms,
+                    retry_backoff_strategy,
+                    retry_max_interval_ms,
+                );
+                if delay_ms > 0 {
+                    tracing::info!(
+                        "Retry attempt {}/{} for upstream '{}' model='{}', waiting {}ms",
+                        attempt, max_attempts - 1, upstream.name, routed_model, delay_ms
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms as u64)).await;
+                }
+            }
+
+            let upstream_rate_config = UpstreamRateLimitConfig {
+                daily_request_limit: upstream.daily_request_limit,
+                monthly_request_limit: upstream.monthly_request_limit,
+            };
+
+            if let Err(e) = state
+                .upstream_rate_limiter
+                .check_limit(upstream.id, &upstream_rate_config)
+            {
+                tracing::warn!("Upstream '{}' rate limit exceeded: {}", upstream.name, e);
+                last_error = Some(AppError::RateLimitExceeded(e));
+                break 'retry;
+            }
+
+            let request_body_str: Option<String> = body.as_ref().map(|b: &Value| b.to_string());
+            let messages = extract_messages_from_anthropic_request(&body);
+
+            let upstream_body = replace_request_model(&body, routed_model);
+            let upstream_path = "/v1/messages".to_string();
+
+            let upstream_config = upstream.to_config();
+            match state
+                .client
+                .proxy_request(
+                    &upstream_config,
+                    &upstream_path,
+                    method.clone(),
+                    upstream_body,
+                    &incoming_headers,
+                    Some(&model_headers),
+                )
+                .await
+            {
+                Ok(response) => {
+                    let status = response.status();
+
+                    if status == StatusCode::TOO_MANY_REQUESTS {
+                        let error_body = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                        tracing::info!("Anthropic upstream '{}' model='{}' attempt {}/{} returned 429", upstream.name, routed_model, attempt + 1, max_attempts);
+                        let error_message = format!("Upstream rate limit: {} - {}", status, error_body);
+                        log_upstream_error(&state.error_logger, &upstream.base_url, routed_model, &error_message, Some(status.as_u16())).await;
+                        last_error = Some(AppError::RateLimitExceeded(
+                            "Upstream rate limit exceeded".to_string(),
+                        ));
+                        continue 'retry;
+                    }
+
+                    if status.is_client_error() || status.is_server_error() {
+                        let error_body = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                        tracing::info!("Anthropic upstream '{}' model='{}' attempt {}/{} returned {}", upstream.name, routed_model, attempt + 1, max_attempts, status.as_u16());
+
+                        if is_rate_limit_error(&error_body, status) {
+                            let error_message = format!("Upstream rate limit: {} - {}", status, error_body);
+                            log_upstream_error(&state.error_logger, &upstream.base_url, routed_model, &error_message, Some(status.as_u16())).await;
+                            last_error = Some(AppError::RateLimitExceeded(
+                                "Upstream rate limit exceeded".to_string(),
+                            ));
+                            continue 'retry;
+                        }
+
+                        let error_message = format!("Upstream error: {} - {}", status, error_body);
+                        log_upstream_error(&state.error_logger, &upstream.base_url, routed_model, &error_message, Some(status.as_u16())).await;
+                        last_error = Some(AppError::Internal(error_message));
+                        continue 'retry;
+                    }
+
+                    tracing::info!("Anthropic upstream '{}' model='{}' attempt {}/{} returned {}", upstream.name, routed_model, attempt + 1, max_attempts, status.as_u16());
+
+                    if is_stream {
+                        return handle_stream_response(
+                            state, response, conversation, api_key.id, upstream.id,
+                            true, model.to_string(), routed_model.to_string(),
+                            upstream.provider.clone(),
+                            request_body_str, messages,
+                            pending_proxy_log_id,
+                        ).await;
+                    } else {
+                        match handle_normal_response(
+                            state.clone(), response, conversation.clone(), api_key.id, upstream.id,
+                            true, model.to_string(), routed_model.to_string(),
+                            upstream.provider.clone(),
+                            request_body_str.clone(), messages.clone(),
+                            pending_proxy_log_id,
+                        ).await {
+                            Ok(resp) => return Ok(resp),
+                            Err(e) => {
+                                last_error = Some(e);
+                                continue 'retry;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let error_msg = format!("{}", e);
+                    tracing::warn!(
+                        "Anthropic upstream '{}' model='{}' attempt {}/{} connection error: {}",
+                        upstream.name, routed_model, attempt + 1, max_attempts, error_msg
+                    );
+                    if error_msg.contains("rate limit") || error_msg.contains("too many") || error_msg.contains("429") {
+                        let error_message = format!("Upstream request failed: {}", e);
+                        log_upstream_error(&state.error_logger, &upstream.base_url, routed_model, &error_message, Some(429)).await;
+                        last_error = Some(AppError::RateLimitExceeded("Upstream rate limit exceeded".to_string()));
+                        continue 'retry;
+                    }
+                    let error_message = format!("Upstream request failed: {}", e);
+                    log_upstream_error(&state.error_logger, &upstream.base_url, routed_model, &error_message, None).await;
+                    last_error = Some(AppError::Internal(error_message));
+                    continue 'retry;
+                }
+            }
+        }
+
+        tracing::info!(
+            "Anthropic upstream '{}' model='{}' all attempts exhausted, checking fallback",
+            upstream.name, routed_model_clone
+        );
+
+        tried_upstream_ids.push(upstream_id);
+
+        if current_retry_failure_strategy == "route" {
+            if let Some(fallback_upstream_id) = current_retry_fallback_upstream_id {
+                if let Some(fallback_upstream) = state.store.get_upstream(fallback_upstream_id).await {
+                    if fallback_upstream.status == "active" {
+                        let fallback_api_type = fallback_upstream.api_type.to_lowercase();
+                        if fallback_api_type != "anthropic" {
+                            tracing::warn!("Fallback upstream '{}' is not Anthropic type, skipping for Anthropic client request", fallback_upstream.name);
+                        } else {
+                            let fallback_model = current_retry_fallback_model_name.as_deref().unwrap_or(model);
+                            if state.store.check_model_access(api_key.user_id, fallback_upstream_id, fallback_model).await {
+                                if !tried_upstream_ids.contains(&fallback_upstream_id) {
+                                    tracing::info!(
+                                        "Routing to Anthropic fallback: upstream='{}', model='{}'",
+                                        fallback_upstream.name, fallback_model
+                                    );
+                                    let fallback_vis = state.store.get_model_visibility(fallback_upstream_id, fallback_model).await;
+                                    let insert_pos = upstream_idx + 1;
+                                    available_upstreams.insert(insert_pos, (fallback_upstream, fallback_model.to_string(), fallback_vis));
+                                } else {
+                                    tracing::debug!("Fallback upstream '{}' already tried, skipping", fallback_upstream.name);
+                                }
+                            }
+                        }
+                    } else {
+                        tracing::warn!("Fallback upstream '{}' is not available (status={})", fallback_upstream.name, fallback_upstream.status);
+                    }
+                } else {
+                    tracing::warn!("Fallback upstream {} not found in cache", fallback_upstream_id);
+                }
+            }
+        }
+
+        upstream_idx += 1;
+    }
+
+    let request_body_str: Option<String> = body.as_ref().map(|b: &Value| b.to_string());
+    let messages = extract_messages_from_anthropic_request(&body);
+    let error_message = last_error.as_ref().map(|e| e.to_string()).unwrap_or_default();
+
+    if let Some(log_id) = pending_proxy_log_id {
+        let content = ProxyLogContent {
+            id: log_id.into(),
+            request_body: request_body_str.clone(),
+            response_body: None,
+            messages,
+        };
+        state.store.update_proxy_log_with_content(
+            log_id, "failed".to_string(), Some(error_message.clone()),
+            0, 0, 0,
+            Some(last_routed_model.clone()), last_provider.clone(),
+            content,
+        );
+    } else {
+        let _ = write_failed_proxy_log(
+            &state.store, &conversation, api_key.id,
+            Some(last_routed_model), last_provider.clone(), request_body_str, messages,
+            error_message, None,
+        );
+    }
+
+    let _ = state.store.update_conversation(
+        conversation.id,
+        ConversationUpdate {
+            provider: Some(last_provider),
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            total_tokens: Some(0),
+            ended_at: Some(Utc::now()),
+        },
+    );
+
+    Err(last_error.unwrap_or_else(|| {
+        AppError::ServiceUnavailable("All Anthropic upstreams are unavailable".to_string())
+    }))
 }
 
 pub async fn proxy_handler(
@@ -220,6 +716,11 @@ pub async fn proxy_handler(
                 tracing::debug!("Skipping conditional route upstream '{}' (status={})", upstream.name, upstream.status);
                 continue;
             }
+            let upstream_api_type = upstream.api_type.to_lowercase();
+            if upstream_api_type == "anthropic" {
+                tracing::debug!("Skipping Anthropic upstream '{}' for OpenAI client request", upstream.name);
+                continue;
+            }
             let vis = state
                 .store
                 .get_model_visibility(upstream.id, &routed_model)
@@ -235,6 +736,10 @@ pub async fn proxy_handler(
             continue;
         }
         if used_upstream_ids.contains(&u.id) {
+            continue;
+        }
+        let upstream_api_type = u.api_type.to_lowercase();
+        if upstream_api_type == "anthropic" {
             continue;
         }
         if let Some(routed_model) = state
@@ -382,16 +887,13 @@ pub async fn proxy_handler(
                 break 'retry;
             }
 
-            let is_ollama = upstream.api_type.eq_ignore_ascii_case("ollama") || upstream.provider.eq_ignore_ascii_case("ollama");
-            let is_anthropic = upstream.api_type.eq_ignore_ascii_case("anthropic") || upstream.provider.eq_ignore_ascii_case("anthropic");
-            let is_minimax = upstream.provider == "minimax";
+            let is_anthropic_upstream = upstream.api_type.eq_ignore_ascii_case("anthropic") || upstream.provider.eq_ignore_ascii_case("anthropic");
             let request_body_str: Option<String> = body.as_ref().map(|b: &Value| b.to_string());
             let messages = extract_messages_from_request(&body);
 
             let (upstream_path, upstream_body) = match build_upstream_request(
-                &body, routed_model, is_ollama, is_anthropic, is_minimax, &upstream.base_url, &path,
-                &state, &mut last_error,
-            ).await {
+                &body, routed_model, is_anthropic_upstream, &upstream.base_url, &path,
+            ) {
                 Some(result) => result,
                 None => {
                     tracing::warn!("Failed to build upstream request for '{}' model='{}'", upstream.name, routed_model);
@@ -450,7 +952,7 @@ pub async fn proxy_handler(
                     if is_stream {
                         return handle_stream_response(
                             state, response, conversation, api_key.id, upstream.id,
-                            is_ollama, is_anthropic, model.to_string(), routed_model.to_string(),
+                            is_anthropic_upstream, model.to_string(), routed_model.to_string(),
                             upstream.provider.clone(),
                             request_body_str, messages,
                             pending_proxy_log_id,
@@ -458,7 +960,7 @@ pub async fn proxy_handler(
                     } else {
                         match handle_normal_response(
                             state.clone(), response, conversation.clone(), api_key.id, upstream.id,
-                            is_ollama, is_anthropic, model.to_string(), routed_model.to_string(),
+                            is_anthropic_upstream, model.to_string(), routed_model.to_string(),
                             upstream.provider.clone(),
                             request_body_str.clone(), messages.clone(),
                             pending_proxy_log_id,
@@ -503,21 +1005,26 @@ pub async fn proxy_handler(
             if let Some(fallback_upstream_id) = current_retry_fallback_upstream_id {
                 if let Some(fallback_upstream) = state.store.get_upstream(fallback_upstream_id).await {
                     if fallback_upstream.status == "active" {
-                        let fallback_model = current_retry_fallback_model_name.as_deref().unwrap_or(model);
-                        if state.store.check_model_access(api_key.user_id, fallback_upstream_id, fallback_model).await {
-                            if !tried_upstream_ids.contains(&fallback_upstream_id) {
-                                tracing::info!(
-                                    "Routing to fallback: upstream='{}', model='{}' (original upstream '{}' failed)",
-                                    fallback_upstream.name, fallback_model, upstream.name
-                                );
-                                let fallback_vis = state.store.get_model_visibility(fallback_upstream_id, fallback_model).await;
-                                let insert_pos = upstream_idx + 1;
-                                available_upstreams.insert(insert_pos, (fallback_upstream, fallback_model.to_string(), fallback_vis));
-                            } else {
-                                tracing::debug!("Fallback upstream '{}' already tried, skipping", fallback_upstream.name);
-                            }
+                        let fallback_api_type = fallback_upstream.api_type.to_lowercase();
+                        if fallback_api_type == "anthropic" {
+                            tracing::warn!("Fallback upstream '{}' is Anthropic type, skipping for OpenAI client request", fallback_upstream.name);
                         } else {
-                            tracing::warn!("Fallback upstream '{}' model '{}' access denied for user {}", fallback_upstream.name, fallback_model, user.username);
+                            let fallback_model = current_retry_fallback_model_name.as_deref().unwrap_or(model);
+                            if state.store.check_model_access(api_key.user_id, fallback_upstream_id, fallback_model).await {
+                                if !tried_upstream_ids.contains(&fallback_upstream_id) {
+                                    tracing::info!(
+                                        "Routing to fallback: upstream='{}', model='{}' (original upstream '{}' failed)",
+                                        fallback_upstream.name, fallback_model, upstream.name
+                                    );
+                                    let fallback_vis = state.store.get_model_visibility(fallback_upstream_id, fallback_model).await;
+                                    let insert_pos = upstream_idx + 1;
+                                    available_upstreams.insert(insert_pos, (fallback_upstream, fallback_model.to_string(), fallback_vis));
+                                } else {
+                                    tracing::debug!("Fallback upstream '{}' already tried, skipping", fallback_upstream.name);
+                                }
+                            } else {
+                                tracing::warn!("Fallback upstream '{}' model '{}' access denied for user {}", fallback_upstream.name, fallback_model, user.username);
+                            }
                         }
                     } else {
                         tracing::warn!("Fallback upstream '{}' is not available (status={})", fallback_upstream.name, fallback_upstream.status);
@@ -574,72 +1081,16 @@ pub async fn proxy_handler(
     }))
 }
 
-async fn build_upstream_request(
+fn build_upstream_request(
     body: &Option<Value>,
     routed_model: &str,
-    is_ollama: bool,
-    is_anthropic: bool,
-    is_minimax: bool,
+    is_anthropic_upstream: bool,
     base_url: &str,
     path: &str,
-    state: &ProxyState,
-    last_error: &mut Option<AppError>,
 ) -> Option<(String, Option<Value>)> {
-    if is_ollama {
-        let ollama_path = "/api/chat".to_string();
-        let ollama_body = if let Some(ref b) = body {
-            let mut openai_req: ChatCompletionRequest = match serde_json::from_value(b.clone()) {
-                Ok(req) => req,
-                Err(e) => {
-                    let error_message = format!("Invalid request: {}", e);
-                    log_upstream_error(&state.error_logger, base_url, routed_model, &error_message, None).await;
-                    *last_error = Some(AppError::BadRequest(error_message));
-                    return None;
-                }
-            };
-            openai_req.model = routed_model.to_string();
-            match serde_json::to_value(convert_openai_to_ollama_request(&openai_req)) {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    let error_message = format!("Failed to convert request: {}", e);
-                    log_upstream_error(&state.error_logger, base_url, routed_model, &error_message, None).await;
-                    *last_error = Some(AppError::Internal(error_message));
-                    return None;
-                }
-            }
-        } else {
-            None
-        };
-        Some((ollama_path, ollama_body))
-    } else if is_anthropic {
+    if is_anthropic_upstream {
         let anthropic_path = "/v1/messages".to_string();
-        let anthropic_body = if let Some(ref b) = body {
-            let mut openai_req: ChatCompletionRequest = match serde_json::from_value(b.clone()) {
-                Ok(req) => req,
-                Err(e) => {
-                    let error_message = format!("Invalid request: {}", e);
-                    log_upstream_error(&state.error_logger, base_url, routed_model, &error_message, None).await;
-                    *last_error = Some(AppError::BadRequest(error_message));
-                    return None;
-                }
-            };
-            openai_req.model = routed_model.to_string();
-            match serde_json::to_value(convert_openai_to_anthropic_request(&openai_req)) {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    let error_message = format!("Failed to convert request: {}", e);
-                    log_upstream_error(&state.error_logger, base_url, routed_model, &error_message, None).await;
-                    *last_error = Some(AppError::Internal(error_message));
-                    return None;
-                }
-            }
-        } else {
-            None
-        };
-        Some((anthropic_path, anthropic_body))
-    } else if is_minimax {
-        let minimax_path = "/v1/chat/completions".to_string();
-        Some((minimax_path, replace_request_model(body, routed_model)))
+        Some((anthropic_path, replace_request_model(body, routed_model)))
     } else {
         Some((
             normalize_upstream_chat_path(base_url, path),
@@ -683,6 +1134,66 @@ fn rand_random_factor() -> f64 {
         .unwrap_or_default()
         .subsec_nanos();
     (nanos as f64 / u32::MAX as f64) * 2.0 - 1.0
+}
+
+fn dump_decode_error(
+    conversation_id: &str,
+    model: &str,
+    upstream_url: &str,
+    request_body: Option<&str>,
+    response_headers: &reqwest::header::HeaderMap,
+    raw_response_bytes: Option<&[u8]>,
+    error_message: &str,
+) {
+    let now = Utc::now();
+    let filename = format!("data/debug_decode_errors/{}_{}.log", now.format("%Y%m%d_%H%M%S"), conversation_id.chars().take(8).collect::<String>());
+    let path = PathBuf::from(&filename);
+
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let mut content = String::new();
+    content.push_str(&format!("=== Decode Error Debug Log ===\n"));
+    content.push_str(&format!("Time: {}\n", now.to_rfc3339()));
+    content.push_str(&format!("Conversation ID: {}\n", conversation_id));
+    content.push_str(&format!("Model: {}\n", model));
+    content.push_str(&format!("Upstream URL: {}\n", upstream_url));
+    content.push_str(&format!("Error: {}\n\n", error_message));
+
+    content.push_str("=== Response Headers ===\n");
+    for (name, value) in response_headers {
+        content.push_str(&format!("{}: {}\n", name, value.to_str().unwrap_or("<binary>")));
+    }
+    content.push_str("\n");
+
+    content.push_str("=== Request Body ===\n");
+    if let Some(body) = request_body {
+        let truncated = if body.len() > 10000 { &body[..10000] } else { body };
+        content.push_str(truncated);
+        if body.len() > 10000 {
+            content.push_str(&format!("\n... [truncated, total {} bytes]", body.len()));
+        }
+    } else {
+        content.push_str("<none>");
+    }
+    content.push_str("\n\n");
+
+    content.push_str("=== Raw Response Bytes (first 2000) ===\n");
+    if let Some(bytes) = raw_response_bytes {
+        let truncated = if bytes.len() > 2000 { &bytes[..2000] } else { bytes };
+        content.push_str(&format!("Hex: {}\n", hex::encode(truncated)));
+        content.push_str(&format!("UTF8 lossy: {}\n", String::from_utf8_lossy(truncated)));
+        content.push_str(&format!("Total bytes: {}\n", bytes.len()));
+    } else {
+        content.push_str("<not available>");
+    }
+    content.push_str("\n");
+
+    match std::fs::write(&path, &content) {
+        Ok(_) => tracing::info!("Decode error debug log written to {}", filename),
+        Err(e) => tracing::error!("Failed to write decode error debug log: {}", e),
+    }
 }
 
 fn is_rate_limit_error(body: &str, status: StatusCode) -> bool {
@@ -809,6 +1320,73 @@ fn extract_messages_from_request(body: &Option<Value>) -> Vec<MessageRecord> {
     messages
 }
 
+fn extract_messages_from_anthropic_request(body: &Option<Value>) -> Vec<MessageRecord> {
+    let mut messages = Vec::new();
+
+    if let Some(b) = body {
+        if let Some(msgs) = b.get("messages").and_then(|m| m.as_array()) {
+            for msg in msgs {
+                if let Some(role) = msg.get("role").and_then(|r| r.as_str()) {
+                    let content = extract_anthropic_message_content(msg);
+                    messages.push(MessageRecord {
+                        role: role.to_string(),
+                        content,
+                    });
+                }
+            }
+        }
+    }
+
+    messages
+}
+
+fn extract_anthropic_message_content(msg: &Value) -> String {
+    if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+        return content.to_string();
+    }
+    if let Some(blocks) = msg.get("content").and_then(|c| c.as_array()) {
+        return blocks.iter()
+            .filter_map(|b| {
+                if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    String::new()
+}
+
+fn extract_routing_text_from_anthropic_request(body: &Option<Value>) -> String {
+    let mut chunks: Vec<String> = Vec::new();
+    if let Some(payload) = body {
+        if let Some(system) = payload.get("system") {
+            if let Some(s) = system.as_str() {
+                chunks.push(s.to_string());
+            } else if let Some(blocks) = system.as_array() {
+                for block in blocks {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            chunks.push(text.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(msgs) = payload.get("messages").and_then(|m| m.as_array()) {
+            for msg in msgs {
+                let content = extract_anthropic_message_content(msg);
+                if !content.is_empty() {
+                    chunks.push(content);
+                }
+            }
+        }
+    }
+    chunks.join("\n")
+}
+
 fn extract_routing_text_from_request(body: &Option<Value>) -> String {
     let mut chunks: Vec<String> = Vec::new();
     if let Some(payload) = body {
@@ -839,8 +1417,7 @@ async fn handle_normal_response(
     conversation: ConversationRecord,
     api_key_id: Uuid,
     upstream_id: Uuid,
-    is_ollama: bool,
-    is_anthropic: bool,
+    is_anthropic_upstream: bool,
     model: String,
     routed_model: String,
     provider: String,
@@ -849,10 +1426,21 @@ async fn handle_normal_response(
     pending_proxy_log_id: Option<Uuid>,
 ) -> AppResult<Response> {
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to read response: {}", e)))?;
+    let resp_headers = response.headers().clone();
+    let raw_bytes = response.bytes().await.map_err(|e| {
+        dump_decode_error(
+            &conversation.id.to_string(), &model, "", request_body_str.as_deref(),
+            &resp_headers, None, &format!("Failed to read response bytes: {}", e),
+        );
+        AppError::Internal(format!("Failed to read response: {}", e))
+    })?;
+    let body = String::from_utf8(raw_bytes.to_vec()).map_err(|e| {
+        dump_decode_error(
+            &conversation.id.to_string(), &model, "", request_body_str.as_deref(),
+            &resp_headers, Some(&raw_bytes), &format!("Response is not valid UTF-8: {}", e),
+        );
+        AppError::Internal(format!("Response is not valid UTF-8: {}", e))
+    })?;
     if !status.is_success() {
         return Err(AppError::Internal(format!(
             "Upstream error: {} - {}",
@@ -862,62 +1450,29 @@ async fn handle_normal_response(
     let normalized_body = normalize_response_body(&body);
 
     let (usage, response_content, response_body): (Option<Usage>, Option<String>, String) =
-        if is_ollama {
-            let mut final_response: Option<OllamaChatResponse> = None;
-            let mut full_content = String::new();
-            let mut full_thinking = String::new();
-
-            for line in body.lines() {
-                if line.is_empty() {
-                    continue;
-                }
-                if let Ok(chunk) = serde_json::from_str::<OllamaChatResponse>(line) {
-                    if let Some(ref message) = chunk.message {
-                        full_content.push_str(&message.content);
-                        if let Some(ref thinking) = message.thinking {
-                            full_thinking.push_str(thinking);
-                        }
-                    }
-
-                    if chunk.done {
-                        final_response = Some(chunk);
-                        break;
-                    }
-                }
-            }
-
-            let mut ollama_response = final_response
-                .ok_or_else(|| AppError::Internal("No final Ollama response found".to_string()))
-                .or_else(|_| {
-                    serde_json::from_str::<OllamaChatResponse>(normalized_body)
-                        .map_err(|_| AppError::Internal("No final Ollama response found".to_string()))
-                })?;
-
-            if let Some(ref mut message) = ollama_response.message {
-                message.content = full_content;
-                if !full_thinking.is_empty() {
-                    message.thinking = Some(full_thinking);
-                }
-            }
-
-            let openai_response = convert_ollama_to_openai_response(ollama_response, &model);
-            let response_body = serde_json::to_string(&openai_response)
-                .map_err(|e| AppError::Internal(format!("Failed to serialize response: {}", e)))?;
-            (
-                openai_response.usage.clone(),
-                extract_content_from_response(&openai_response),
-                response_body,
-            )
-        } else if is_anthropic {
+        if is_anthropic_upstream {
             let response_json: Value = serde_json::from_str(normalized_body)
                 .map_err(|e| AppError::Internal(format!("Failed to parse response: {}", e)))?;
-            let openai_response = convert_anthropic_to_openai_response(&response_json, &model);
-            let response_body = serde_json::to_string(&openai_response)
-                .map_err(|e| AppError::Internal(format!("Failed to serialize response: {}", e)))?;
+            let input_tokens = response_json.get("usage").and_then(|u| u.get("input_tokens")).and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            let output_tokens = response_json.get("usage").and_then(|u| u.get("output_tokens")).and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            let content = response_json.get("content")
+                .and_then(|c| c.as_array())
+                .map(|blocks| {
+                    blocks.iter()
+                        .filter_map(|b| {
+                            if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                b.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("")
+                });
             (
-                openai_response.usage.clone(),
-                extract_content_from_response(&openai_response),
-                response_body,
+                Some(Usage { prompt_tokens: input_tokens, completion_tokens: output_tokens, total_tokens: input_tokens + output_tokens }),
+                content,
+                normalized_body.to_string(),
             )
         } else {
             let chat_response: ChatCompletionResponse = match serde_json::from_str(normalized_body)
@@ -1111,6 +1666,7 @@ fn parse_openai_sse_body(body: &str) -> Option<ChatCompletionResponse> {
     let usage = Usage::from_stream_chunks(&chunks);
     let mut content = String::new();
     let mut reasoning_content = String::new();
+    let mut tool_calls: std::collections::HashMap<usize, (String, String, String)> = std::collections::HashMap::new();
     let mut id = "chatcmpl-stream".to_string();
     let mut object = "chat.completion".to_string();
     let mut created = Utc::now().timestamp();
@@ -1142,6 +1698,21 @@ fn parse_openai_sse_body(body: &str) -> Option<ChatCompletionResponse> {
                 if let Some(v) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
                     reasoning_content.push_str(v);
                 }
+                if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                    for tc in tcs {
+                        let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        let entry = tool_calls.entry(idx).or_insert_with(|| (String::new(), String::new(), String::new()));
+                        if let Some(v) = tc.get("id").and_then(|v| v.as_str()) {
+                            entry.0 = v.to_string();
+                        }
+                        if let Some(v) = tc.get("function").and_then(|f| f.get("name")).and_then(|v| v.as_str()) {
+                            entry.1 = v.to_string();
+                        }
+                        if let Some(v) = tc.get("function").and_then(|f| f.get("arguments")).and_then(|v| v.as_str()) {
+                            entry.2.push_str(v);
+                        }
+                    }
+                }
             }
             if let Some(v) = choice.get("finish_reason").and_then(|v| v.as_str()) {
                 finish_reason = Some(v.to_string());
@@ -1153,6 +1724,24 @@ fn parse_openai_sse_body(body: &str) -> Option<ChatCompletionResponse> {
         model = "unknown".to_string();
     }
 
+    let openai_tool_calls: Vec<crate::proxy::upstream::ToolCall> = if tool_calls.is_empty() {
+        Vec::new()
+    } else {
+        let mut keys: Vec<&usize> = tool_calls.keys().collect();
+        keys.sort();
+        keys.into_iter().map(|idx| {
+            let (id, name, arguments) = tool_calls.get(idx).unwrap();
+            crate::proxy::upstream::ToolCall {
+                id: id.clone(),
+                call_type: "function".to_string(),
+                function: crate::proxy::upstream::FunctionCall {
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                },
+            }
+        }).collect()
+    };
+
     Some(ChatCompletionResponse {
         id,
         object,
@@ -1162,7 +1751,7 @@ fn parse_openai_sse_body(body: &str) -> Option<ChatCompletionResponse> {
             index: 0,
             message: Some(crate::proxy::upstream::ResponseMessage {
                 role: Some("assistant".to_string()),
-                content: if content.is_empty() {
+                content: if content.is_empty() && !openai_tool_calls.is_empty() {
                     None
                 } else {
                     Some(content)
@@ -1171,6 +1760,11 @@ fn parse_openai_sse_body(body: &str) -> Option<ChatCompletionResponse> {
                     None
                 } else {
                     Some(reasoning_content)
+                },
+                tool_calls: if openai_tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(openai_tool_calls)
                 },
             }),
             delta: None,
@@ -1252,8 +1846,7 @@ async fn handle_stream_response(
     conversation: ConversationRecord,
     api_key_id: Uuid,
     upstream_id: Uuid,
-    is_ollama: bool,
-    is_anthropic: bool,
+    is_anthropic_upstream: bool,
     model: String,
     routed_model: String,
     provider: String,
@@ -1276,6 +1869,24 @@ async fn handle_stream_response(
 
     let chat_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
 
+    let content_encoding = response.headers()
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+    if content_encoding != "" && content_encoding != "identity" {
+        tracing::warn!("Upstream returned compressed response (Content-Encoding: {}), this may cause stream decoding issues", content_encoding);
+    }
+
+    let resp_headers = response.headers().clone();
+    let debug_conversation_id = conversation.id.to_string();
+    let debug_model = model.clone();
+    let debug_upstream_url = {
+        let upstream_cache = state.store.get_upstream(upstream_id).await;
+        upstream_cache.map(|u| u.base_url.clone()).unwrap_or_default()
+    };
+    let debug_request_body = request_body_str.clone();
+
     tokio::spawn(async move {
         let mut stream = response.bytes_stream();
         let mut total_input_tokens = 0i64;
@@ -1286,56 +1897,21 @@ async fn handle_stream_response(
         let mut sse_data_lines: Vec<String> = Vec::new();
         let mut full_response_content = String::new();
         let mut full_reasoning_content = String::new();
+        let mut raw_bytes_collected: Vec<u8> = Vec::new();
+        let mut stream_ended_normally = false;
         let mut stream_error: Option<String> = None;
 
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
+                    if raw_bytes_collected.len() < 65536 {
+                        let remaining = 65536 - raw_bytes_collected.len();
+                        let to_append = if bytes.len() > remaining { &bytes[..remaining] } else { &bytes[..] };
+                        raw_bytes_collected.extend_from_slice(to_append);
+                    }
                     let text = String::from_utf8_lossy(&bytes);
 
-                    if is_ollama {
-                        buffer.push_str(&text);
-
-                        while let Some(newline_pos) = buffer.find('\n') {
-                            let line = buffer[..newline_pos].to_string();
-                            buffer = buffer[newline_pos + 1..].to_string();
-
-                            if line.is_empty() {
-                                continue;
-                            }
-
-                            if let Ok(ollama_chunk) =
-                                serde_json::from_str::<OllamaStreamChunk>(&line)
-                            {
-                                if ollama_chunk.done {
-                                    if let (Some(prompt_tokens), Some(completion_tokens)) =
-                                        (ollama_chunk.prompt_eval_count, ollama_chunk.eval_count)
-                                    {
-                                        total_input_tokens = prompt_tokens;
-                                        total_output_tokens = completion_tokens;
-                                    }
-                                }
-
-                                if let Some(ref message) = ollama_chunk.message {
-                                    full_response_content.push_str(&message.content);
-                                    if let Some(ref thinking) = message.thinking {
-                                        full_reasoning_content.push_str(thinking);
-                                    }
-                                }
-
-                                if let Some(openai_chunk) = convert_ollama_stream_to_openai(
-                                    ollama_chunk,
-                                    &model_clone,
-                                    &chat_id,
-                                ) {
-                                    chunks.push(openai_chunk.clone());
-                                    let _ = tx
-                                        .send(Ok(Event::default().data(openai_chunk.to_string())))
-                                        .await;
-                                }
-                            }
-                        }
-                    } else if is_anthropic {
+                    if is_anthropic_upstream {
                         buffer.push_str(&text);
 
                         while let Some(newline_pos) = buffer.find('\n') {
@@ -1362,9 +1938,7 @@ async fn handle_stream_response(
                             }
 
                             let data = sse_data_lines.join("\n");
-                            if data == "[DONE]" {
-                                let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
-                            } else if let Ok(json) = serde_json::from_str::<Value>(&data) {
+                            if let Ok(json) = serde_json::from_str::<Value>(&data) {
                                 if let Some(event_name) = sse_event_name.as_deref() {
                                     if event_name == "message_start" {
                                         if let Some(input_tokens) = json
@@ -1383,6 +1957,8 @@ async fn handle_stream_response(
                                         {
                                             total_output_tokens = output_tokens;
                                         }
+                                    } else if event_name == "message_stop" {
+                                        stream_ended_normally = true;
                                     }
                                 }
                                 if let Some(text_delta) = json
@@ -1406,30 +1982,12 @@ async fn handle_stream_response(
                                 {
                                     full_response_content.push_str(text_start);
                                 }
-                                if let Some(thinking_start) = json
-                                    .get("content_block")
-                                    .and_then(|d| d.get("thinking"))
-                                    .and_then(|v| v.as_str())
-                                {
-                                    full_reasoning_content.push_str(thinking_start);
-                                }
                                 chunks.push(json.clone());
-
-                                if let Some(event_name) = sse_event_name.as_deref() {
-                                    let openai_chunks = convert_anthropic_stream_to_openai(
-                                        event_name,
-                                        &json,
-                                        &model_clone,
-                                        &chat_id,
-                                    );
-                                    for openai_chunk in openai_chunks {
-                                        if let Some(chunk_data) = openai_chunk {
-                                            let _ = tx
-                                                .send(Ok(Event::default().data(chunk_data.to_string())))
-                                                .await;
-                                        }
-                                    }
+                                let mut sse_event = Event::default().data(&data);
+                                if let Some(ref name) = sse_event_name {
+                                    sse_event = sse_event.event(name.as_str());
                                 }
+                                let _ = tx.send(Ok(sse_event)).await;
                             }
 
                             sse_event_name = None;
@@ -1449,7 +2007,7 @@ async fn handle_stream_response(
                             }
                             if let Some(data) = line.strip_prefix("data: ") {
                                 if data == "[DONE]" {
-                                    let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+                                    stream_ended_normally = true;
                                     continue;
                                 }
 
@@ -1481,25 +2039,145 @@ async fn handle_stream_response(
                     }
                 }
                 Err(e) => {
-                    let err = format!("Stream error: {}", e);
-                    tracing::error!("{}", err);
-                    stream_error = Some(err);
+                    let err_display = e.to_string();
+                    let err_debug = format!("{:?}", e);
+                    let is_timeout = e.is_timeout()
+                        || err_display.contains("timeout")
+                        || err_display.contains("TimedOut")
+                        || err_debug.contains("TimedOut")
+                        || err_debug.contains("timeout");
+                    if is_timeout {
+                        tracing::warn!("Stream ended (read timeout, upstream may have stopped sending data): {}", e);
+                    } else if e.is_decode() {
+                        tracing::warn!("Stream ended (decode error, likely upstream closed connection): {}", e);
+                        dump_decode_error(
+                            &debug_conversation_id,
+                            &debug_model,
+                            &debug_upstream_url,
+                            debug_request_body.as_deref(),
+                            &resp_headers,
+                            Some(&raw_bytes_collected),
+                            &err_display,
+                        );
+                    } else {
+                        tracing::warn!("Stream ended (connection error): {}", e);
+                        dump_decode_error(
+                            &debug_conversation_id,
+                            &debug_model,
+                            &debug_upstream_url,
+                            debug_request_body.as_deref(),
+                            &resp_headers,
+                            Some(&raw_bytes_collected),
+                            &err_display,
+                        );
+                    }
+                    stream_error = Some(err_display);
                     break;
                 }
             }
         }
 
-        if is_ollama {
+        if !buffer.trim().is_empty() && !stream_ended_normally {
+            let remaining = buffer.trim().to_string();
+            tracing::debug!("Processing remaining buffer data after stream ended: {} bytes", remaining.len());
+            if is_anthropic_upstream {
+                for line in remaining.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Some(event_name) = line.strip_prefix("event: ") {
+                        sse_event_name = Some(event_name.to_string());
+                        continue;
+                    }
+                    if let Some(data_line) = line.strip_prefix("data: ") {
+                        sse_data_lines.push(data_line.to_string());
+                        continue;
+                    }
+                }
+                if !sse_data_lines.is_empty() {
+                    let data = sse_data_lines.join("\n");
+                    if let Ok(json) = serde_json::from_str::<Value>(&data) {
+                        if let Some(event_name) = sse_event_name.as_deref() {
+                            if event_name == "message_stop" {
+                                stream_ended_normally = true;
+                            }
+                        }
+                        chunks.push(json.clone());
+                        let mut sse_event = Event::default().data(&data);
+                        if let Some(ref name) = sse_event_name {
+                            sse_event = sse_event.event(name.as_str());
+                        }
+                        let _ = tx.send(Ok(sse_event)).await;
+                    }
+                }
+            } else {
+                for line in remaining.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Some(data) = line.strip_prefix("data: ") {
+                        if data == "[DONE]" {
+                            stream_ended_normally = true;
+                            continue;
+                        }
+                        if let Ok(json) = serde_json::from_str::<Value>(data) {
+                            if let Some(content) = json
+                                .get("choices")
+                                .and_then(|c| c.get(0))
+                                .and_then(|c| c.get("delta"))
+                                .and_then(|d| d.get("content"))
+                                .and_then(|c| c.as_str())
+                            {
+                                full_response_content.push_str(content);
+                            }
+                            chunks.push(json.clone());
+                            let _ = tx.send(Ok(Event::default().data(data.to_string()))).await;
+                        }
+                    }
+                }
+            }
+        }
+
+        if stream_error.is_none() && !stream_ended_normally && !chunks.is_empty() {
+            stream_ended_normally = true;
+        }
+
+        if stream_ended_normally {
+            let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+        } else if chunks.is_empty() && full_response_content.is_empty() {
+            tracing::warn!(
+                "Stream ended abnormally with no data received for model={}, sending error event to client",
+                debug_model
+            );
+            let error_data = serde_json::json!({
+                "error": {
+                    "message": "Stream interrupted: connection to upstream was lost or timed out",
+                    "type": "upstream_error",
+                    "code": "stream_interrupted"
+                }
+            });
+            let _ = tx.send(Ok(Event::default().data(error_data.to_string()))).await;
+            let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+        } else {
+            tracing::warn!(
+                "Stream ended abnormally for model={}, but {} bytes of content already received, sending graceful completion",
+                debug_model,
+                full_response_content.len()
+            );
+            let finish_data = serde_json::json!({
+                "choices": [{
+                    "delta": {},
+                    "finish_reason": "stop",
+                    "index": 0
+                }]
+            });
+            let _ = tx.send(Ok(Event::default().data(finish_data.to_string()))).await;
             let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
         }
 
-        let usage = if is_ollama && total_input_tokens > 0 {
-            Usage {
-                prompt_tokens: total_input_tokens as i32,
-                completion_tokens: total_output_tokens as i32,
-                total_tokens: (total_input_tokens + total_output_tokens) as i32,
-            }
-        } else if is_anthropic && (total_input_tokens > 0 || total_output_tokens > 0) {
+        let usage = if is_anthropic_upstream && (total_input_tokens > 0 || total_output_tokens > 0) {
             Usage {
                 prompt_tokens: total_input_tokens as i32,
                 completion_tokens: total_output_tokens as i32,
@@ -1512,9 +2190,7 @@ async fn handle_stream_response(
         total_input_tokens = usage.prompt_tokens as i64;
         total_output_tokens = usage.completion_tokens as i64;
         let total_tokens = total_input_tokens + total_output_tokens;
-        let failed_reason = if let Some(err) = stream_error {
-            Some(err)
-        } else if chunks.is_empty() && total_tokens == 0 && full_response_content.is_empty() {
+        let failed_reason = if chunks.is_empty() && total_tokens == 0 && full_response_content.is_empty() {
             Some("Empty stream response".to_string())
         } else {
             None
@@ -1553,7 +2229,7 @@ async fn handle_stream_response(
 
         let response_body = if chunks.is_empty() {
             None
-        } else if is_anthropic {
+        } else if is_anthropic_upstream {
             Some(Value::Array(chunks.clone()).to_string())
         } else {
             let mut message = serde_json::json!({

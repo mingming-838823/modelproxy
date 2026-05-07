@@ -127,10 +127,15 @@ pub struct UpstreamClient {
 impl UpstreamClient {
     pub fn new(config: &ProxyConfig) -> AppResult<Self> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(config.request_timeout_secs))
             .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+            .read_timeout(Duration::from_secs(120))
             .pool_max_idle_per_host(config.max_idle_connections)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(60))
             .no_proxy()
+            .no_brotli()
+            .no_deflate()
+            .no_gzip()
             .build()
             .map_err(|e| AppError::Internal(format!("Failed to create HTTP client: {}", e)))?;
 
@@ -315,6 +320,10 @@ pub struct ChatCompletionRequest {
     pub max_completion_tokens: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<Value>,
 }
 
 impl ChatCompletionRequest {
@@ -326,9 +335,30 @@ impl ChatCompletionRequest {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Message {
     pub role: String,
+    #[serde(default)]
     pub content: MessageContent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub function: FunctionCall,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -418,6 +448,8 @@ pub struct ResponseMessage {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -426,6 +458,27 @@ pub struct Delta {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<DeltaToolCall>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DeltaToolCall {
+    pub index: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub call_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<DeltaFunctionCall>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DeltaFunctionCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -598,12 +651,17 @@ mod tests {
                         },
                     ]),
                     reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
                 },
             ],
             temperature: None,
             max_tokens: Some(1024),
             max_completion_tokens: None,
             stream: None,
+            tools: None,
+            tool_choice: None,
         };
 
         let anthropic_req = convert_openai_to_anthropic_request(&request);
@@ -629,6 +687,8 @@ pub struct OllamaChatRequest {
     pub messages: Vec<OllamaMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<OllamaOptions>,
 }
@@ -667,17 +727,34 @@ pub struct OllamaChatResponse {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OllamaMessage {
     pub role: String,
+    #[serde(default)]
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<OllamaToolCall>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OllamaToolCall {
+    pub function: OllamaFunctionCall,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OllamaFunctionCall {
+    pub name: String,
+    pub arguments: Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OllamaStreamMessage {
     pub role: String,
+    #[serde(default)]
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<OllamaToolCall>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -705,17 +782,34 @@ pub fn convert_openai_to_ollama_request(request: &ChatCompletionRequest) -> Olla
     let messages: Vec<OllamaMessage> = request
         .messages
         .iter()
-        .map(|m| OllamaMessage {
-            role: m.role.clone(),
-            content: m.content.text_content(),
-            thinking: m.reasoning_content.clone(),
+        .map(|m| {
+            let tool_calls = m.tool_calls.as_ref().map(|tcs| {
+                tcs.iter().map(|tc| OllamaToolCall {
+                    function: OllamaFunctionCall {
+                        name: tc.function.name.clone(),
+                        arguments: serde_json::from_str(&tc.function.arguments)
+                            .unwrap_or(Value::Object(serde_json::Map::new())),
+                    },
+                }).collect::<Vec<_>>()
+            });
+            OllamaMessage {
+                role: m.role.clone(),
+                content: m.content.text_content(),
+                thinking: m.reasoning_content.clone(),
+                tool_calls,
+            }
         })
         .collect();
+
+    let tools = request.tools.as_ref().map(|t| {
+        serde_json::to_value(t).unwrap_or(Value::Array(Vec::new()))
+    });
 
     OllamaChatRequest {
         model: request.model.clone(),
         messages,
         stream: request.stream,
+        tools,
         options: Some(OllamaOptions {
             temperature: request.temperature,
             num_predict: request.effective_max_tokens(),
@@ -729,12 +823,34 @@ pub fn convert_ollama_to_openai_response(
 ) -> ChatCompletionResponse {
     let usage = Usage::from_ollama_response(&ollama_response);
 
-    // 构建 Message，将 Ollama 的 thinking 映射到 reasoning_content
-    let message = ollama_response.message.map(|m| ResponseMessage {
-        role: Some(m.role),
-        content: Some(m.content),
-        reasoning_content: m.thinking.clone(),
+    let message = ollama_response.message.map(|m| {
+        let tool_calls = m.tool_calls.map(|tcs| {
+            tcs.into_iter().enumerate().map(|(i, tc)| ToolCall {
+                id: format!("call_{}", i),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name: tc.function.name,
+                    arguments: serde_json::to_string(&tc.function.arguments).unwrap_or_default(),
+                },
+            }).collect::<Vec<_>>()
+        });
+        ResponseMessage {
+            role: Some(m.role),
+            content: if m.content.is_empty() && tool_calls.is_some() {
+                None
+            } else {
+                Some(m.content)
+            },
+            reasoning_content: m.thinking.clone(),
+            tool_calls,
+        }
     });
+
+    let finish_reason = if message.as_ref().and_then(|m| m.tool_calls.as_ref()).is_some() {
+        Some("tool_calls".to_string())
+    } else {
+        ollama_response.done_reason.clone()
+    };
 
     ChatCompletionResponse {
         id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
@@ -745,7 +861,7 @@ pub fn convert_ollama_to_openai_response(
             index: 0,
             message,
             delta: None,
-            finish_reason: ollama_response.done_reason.clone(),
+            finish_reason,
         }],
         usage: Some(usage),
     }
@@ -764,6 +880,8 @@ pub fn convert_ollama_stream_to_openai(
                 as i32,
         };
 
+        let finish_reason = chunk.done_reason.unwrap_or_else(|| "stop".to_string());
+
         Some(serde_json::json!({
             "id": chat_id,
             "object": "chat.completion.chunk",
@@ -772,20 +890,33 @@ pub fn convert_ollama_stream_to_openai(
             "choices": [{
                 "index": 0,
                 "delta": {"role": "assistant", "content": ""},
-                "finish_reason": chunk.done_reason.unwrap_or_else(|| "stop".to_string())
+                "finish_reason": finish_reason
             }],
             "usage": usage
         }))
     } else if let Some(message) = &chunk.message {
-        // 构建 delta，包含 reasoning_content
         let mut delta = serde_json::json!({
             "role": "assistant",
             "content": message.content
         });
 
-        // 如果 message 中有 thinking 内容，添加到 reasoning_content
         if let Some(ref thinking) = message.thinking {
             delta["reasoning_content"] = serde_json::json!(thinking);
+        }
+
+        if let Some(ref tool_calls) = message.tool_calls {
+            let openai_tool_calls: Vec<Value> = tool_calls.iter().enumerate().map(|(i, tc)| {
+                serde_json::json!({
+                    "index": i,
+                    "id": format!("call_{}", i),
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": serde_json::to_string(&tc.function.arguments).unwrap_or_default()
+                    }
+                })
+            }).collect();
+            delta["tool_calls"] = serde_json::json!(openai_tool_calls);
         }
 
         Some(serde_json::json!({
@@ -815,7 +946,18 @@ pub struct AnthropicMessageRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<String>,
+    pub system: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<AnthropicTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AnthropicTool {
+    pub name: String,
+    pub description: Option<String>,
+    pub input_schema: Value,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -864,6 +1006,19 @@ pub enum AnthropicContentBlock {
     Text { text: String },
     #[serde(rename = "image")]
     Image { source: AnthropicImageSource },
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    #[serde(rename = "tool_result")]
+    ToolResult {
+        tool_use_id: String,
+        content: Option<AnthropicContent>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -893,6 +1048,43 @@ pub fn convert_openai_to_anthropic_request(
     for msg in &request.messages {
         if msg.role == "system" {
             system_parts.push(msg.content.text_content());
+        } else if msg.role == "tool" {
+            let tool_use_id = msg.tool_call_id.clone().unwrap_or_default();
+            let content = convert_openai_content_to_anthropic(&msg.content);
+            messages.push(AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicContent::Blocks(vec![AnthropicContentBlock::ToolResult {
+                    tool_use_id,
+                    content: Some(content),
+                    is_error: None,
+                }]),
+            });
+        } else if msg.role == "assistant" {
+            if let Some(ref tool_calls) = msg.tool_calls {
+                let mut blocks: Vec<AnthropicContentBlock> = Vec::new();
+                let text = msg.content.text_content();
+                if !text.is_empty() {
+                    blocks.push(AnthropicContentBlock::Text { text });
+                }
+                for tc in tool_calls {
+                    let input: Value = serde_json::from_str(&tc.function.arguments).unwrap_or(Value::Object(serde_json::Map::new()));
+                    blocks.push(AnthropicContentBlock::ToolUse {
+                        id: tc.id.clone(),
+                        name: tc.function.name.clone(),
+                        input,
+                    });
+                }
+                messages.push(AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: AnthropicContent::from_blocks(blocks),
+                });
+            } else {
+                let content = convert_openai_content_to_anthropic(&msg.content);
+                messages.push(AnthropicMessage {
+                    role: msg.role.clone(),
+                    content,
+                });
+            }
         } else {
             let content = convert_openai_content_to_anthropic(&msg.content);
             messages.push(AnthropicMessage {
@@ -905,8 +1097,48 @@ pub fn convert_openai_to_anthropic_request(
     let system = if system_parts.is_empty() {
         None
     } else {
-        Some(system_parts.join("\n\n"))
+        Some(Value::String(system_parts.join("\n\n")))
     };
+
+    let tools = request.tools.as_ref().map(|t| {
+        t.iter().map(|tool| {
+            let name = tool.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
+            let description = tool.get("function")
+                .and_then(|f| f.get("description"))
+                .and_then(|d| d.as_str())
+                .map(|s| s.to_string());
+            let input_schema = tool.get("function")
+                .and_then(|f| f.get("parameters"))
+                .cloned()
+                .unwrap_or(Value::Object(serde_json::Map::new()));
+            AnthropicTool { name, description, input_schema }
+        }).collect::<Vec<_>>()
+    });
+
+    let tool_choice = request.tool_choice.as_ref().and_then(|tc| {
+        if tc.is_string() {
+            let s = tc.as_str().unwrap_or("");
+            match s {
+                "auto" => Some(serde_json::json!({"type": "auto"})),
+                "none" => None,
+                "required" => Some(serde_json::json!({"type": "any"})),
+                _ => None,
+            }
+        } else if tc.is_object() {
+            if let Some(func) = tc.get("function") {
+                let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                Some(serde_json::json!({"type": "tool", "name": name}))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    });
 
     let messages = merge_consecutive_roles(messages);
 
@@ -917,6 +1149,8 @@ pub fn convert_openai_to_anthropic_request(
         temperature: request.temperature,
         stream: request.stream,
         system,
+        tools,
+        tool_choice,
     }
 }
 
@@ -994,6 +1228,8 @@ pub fn convert_anthropic_to_openai_response(
 ) -> ChatCompletionResponse {
     let mut content = String::new();
     let mut reasoning_content = String::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+
     if let Some(content_blocks) = response.get("content").and_then(|c| c.as_array()) {
         for block in content_blocks {
             let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -1007,6 +1243,18 @@ pub fn convert_anthropic_to_openai_response(
                     if let Some(thinking) = block.get("thinking").and_then(|t| t.as_str()) {
                         reasoning_content.push_str(thinking);
                     }
+                }
+                "tool_use" => {
+                    let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let arguments = block.get("input")
+                        .map(|v| serde_json::to_string(v).unwrap_or_default())
+                        .unwrap_or_default();
+                    tool_calls.push(ToolCall {
+                        id,
+                        call_type: "function".to_string(),
+                        function: FunctionCall { name, arguments },
+                    });
                 }
                 _ => {}
             }
@@ -1032,6 +1280,7 @@ pub fn convert_anthropic_to_openai_response(
     let finish_reason = match stop_reason {
         "end_turn" | "stop" => "stop".to_string(),
         "max_tokens" => "length".to_string(),
+        "tool_use" => "tool_calls".to_string(),
         other => other.to_string(),
     };
 
@@ -1053,6 +1302,11 @@ pub fn convert_anthropic_to_openai_response(
                     None
                 } else {
                     Some(reasoning_content)
+                },
+                tool_calls: if tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(tool_calls)
                 },
             }),
             delta: None,
@@ -1114,6 +1368,34 @@ pub fn convert_anthropic_stream_to_openai(
                         })));
                     }
                 }
+            } else if block_type == "tool_use" {
+                let index = data.get("index").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                let id = data.get("content_block")
+                    .and_then(|cb| cb.get("id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let name = data.get("content_block")
+                    .and_then(|cb| cb.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                chunks.push(Some(serde_json::json!({
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": chrono::Utc::now().timestamp(),
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": index,
+                                "id": id,
+                                "type": "function",
+                                "function": {"name": name, "arguments": ""}
+                            }]
+                        },
+                        "finish_reason": null
+                    }]
+                })));
             } else if let Some(text) = data
                 .get("content_block")
                 .and_then(|cb| cb.get("text"))
@@ -1158,6 +1440,28 @@ pub fn convert_anthropic_stream_to_openai(
                         }]
                     })));
                 }
+            } else if delta_type == "input_json_delta" {
+                let index = data.get("index").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                let partial_json = data.get("delta")
+                    .and_then(|d| d.get("partial_json"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                chunks.push(Some(serde_json::json!({
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": chrono::Utc::now().timestamp(),
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": index,
+                                "function": {"arguments": partial_json}
+                            }]
+                        },
+                        "finish_reason": null
+                    }]
+                })));
             } else if let Some(text) = data
                 .get("delta")
                 .and_then(|d| d.get("text"))
@@ -1185,6 +1489,7 @@ pub fn convert_anthropic_stream_to_openai(
             let finish_reason = match stop_reason {
                 "end_turn" | "stop" => "stop",
                 "max_tokens" => "length",
+                "tool_use" => "tool_calls",
                 other => other,
             };
 

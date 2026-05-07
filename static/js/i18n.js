@@ -421,7 +421,7 @@ const translations = {
         apiTypeNames: {
             openai: 'OpenAI API',
             anthropic: 'Anthropic API',
-            ollama: 'Ollama API'
+            ollama: 'Ollama (OpenAI兼容)'
         },
         langLabel: '中文',
         switchLang: 'English'
@@ -846,7 +846,7 @@ const translations = {
         apiTypeNames: {
             openai: 'OpenAI API',
             anthropic: 'Anthropic API',
-            ollama: 'Ollama API'
+            ollama: 'Ollama (OpenAI Compatible)'
         },
         langLabel: 'EN',
         switchLang: '中文'

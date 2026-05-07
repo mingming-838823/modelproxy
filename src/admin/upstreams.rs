@@ -546,12 +546,14 @@ pub async fn test_upstream_model(
 fn model_endpoint_candidates(upstream: &UpstreamConfig) -> Vec<String> {
     let base = upstream.base_url.trim_end_matches('/');
     if upstream.api_type == "ollama" {
-        return vec![format!("{}/api/tags", base)];
-    }
-    if upstream.api_type == "anthropic" || upstream.provider == "anthropic" {
+        if base.ends_with("/v1") {
+            vec![format!("{}/models", base)]
+        } else {
+            vec![format!("{}/v1/models", base)]
+        }
+    } else if upstream.api_type == "anthropic" || upstream.provider == "anthropic" {
         return Vec::new();
-    }
-    if base.ends_with("/v1") {
+    } else if base.ends_with("/v1") {
         vec![
             format!("{}/models", base),
             format!("{}/models", base.trim_end_matches("/v1")),
@@ -564,29 +566,27 @@ fn model_endpoint_candidates(upstream: &UpstreamConfig) -> Vec<String> {
 fn extract_models(data: &serde_json::Value, api_type: &str) -> Vec<ModelInfo> {
     let mut models = Vec::new();
 
-    if api_type == "ollama" {
+    if let Some(arr) = data.get("data").and_then(|v| v.as_array()) {
+        for item in arr {
+            if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                let name = item
+                    .get("object")
+                    .and_then(|v| v.as_str())
+                    .map(|s| format!("{} ({})", id, s))
+                    .unwrap_or_else(|| id.to_string());
+                models.push(ModelInfo {
+                    id: id.to_string(),
+                    name,
+                });
+            }
+        }
+    } else if api_type == "ollama" {
         if let Some(arr) = data.get("models").and_then(|v| v.as_array()) {
             for item in arr {
                 if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
                     models.push(ModelInfo {
                         id: name.to_string(),
                         name: name.to_string(),
-                    });
-                }
-            }
-        }
-    } else {
-        if let Some(arr) = data.get("data").and_then(|v| v.as_array()) {
-            for item in arr {
-                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                    let name = item
-                        .get("object")
-                        .and_then(|v| v.as_str())
-                        .map(|s| format!("{} ({})", id, s))
-                        .unwrap_or_else(|| id.to_string());
-                    models.push(ModelInfo {
-                        id: id.to_string(),
-                        name,
                     });
                 }
             }
@@ -602,18 +602,6 @@ fn build_model_test_request(
     prompt: &str,
 ) -> (String, serde_json::Value) {
     let base = upstream.base_url.trim_end_matches('/');
-    if upstream.api_type == "ollama" {
-        return (
-            format!("{}/api/chat", base),
-            serde_json::json!({
-                "model": model,
-                "messages": [
-                    {"role":"user","content": prompt}
-                ],
-                "stream": false
-            }),
-        );
-    }
     if upstream.api_type == "anthropic" {
         let url = if base.ends_with("/v1") {
             format!("{}/messages", base)
@@ -659,15 +647,6 @@ fn is_qianfan_coding_base(base: &str) -> bool {
 
 fn parse_model_test_output(body_text: &str, api_type: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(body_text).ok()?;
-    if api_type == "ollama" {
-        if let Some(content) = value
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(|v| v.as_str())
-        {
-            return Some(trim_preview(content, 200));
-        }
-    }
     if api_type == "anthropic" {
         if let Some(text) = value
             .get("content")

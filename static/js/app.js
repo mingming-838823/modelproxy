@@ -15,7 +15,7 @@ const PROVIDER_NAMES = {
 const API_TYPE_NAMES = {
     openai: 'OpenAI API',
     anthropic: 'Anthropic API',
-    ollama: 'Ollama API'
+    ollama: 'Ollama (OpenAI兼容)'
 };
 
 let currentUser = null;
@@ -2448,7 +2448,7 @@ function editConditionalAliasVisibility(encodedAlias = '') {
             await api(`/models/conditional-aliases/${encodeURIComponent(alias)}/visibility`, {
                 method: 'PUT',
                 body: JSON.stringify({
-                    all_users_visible: allUsersVisible || userIds.length === 0,
+                    all_users_visible: allUsersVisible,
                     user_ids: userIds
                 })
             });
@@ -2496,7 +2496,7 @@ async function saveModelAlias(upstreamId, encodedModelName, inputId) {
         await api(`/models/${upstreamId}/${encodedModelName}`, {
             method: 'PUT',
             body: JSON.stringify({
-                all_users_visible: allUsersVisible || allowedUsers.length === 0,
+                all_users_visible: allUsersVisible,
                 user_ids: allUsersVisible ? [] : allowedUsers,
                 model_aliases: modelAliases,
                 model_headers: modelHeaders,
@@ -2847,7 +2847,7 @@ async function editModelVisibility(upstreamId, modelName) {
             await api(`/models/${upstreamId}/${encodedModel}`, {
                 method: 'PUT',
                 body: JSON.stringify({
-                    all_users_visible: allUsersVisible || userIds.length === 0,
+                    all_users_visible: allUsersVisible,
                     user_ids: userIds,
                     model_aliases: modelAliases,
                     model_headers: modelHeaders,
@@ -2885,7 +2885,7 @@ async function editUpstream(id) {
                     <select name="api_type" required>
                         <option value="openai" ${upstream.api_type === 'openai' ? 'selected' : ''}>OpenAI API</option>
                         <option value="anthropic" ${upstream.api_type === 'anthropic' ? 'selected' : ''}>Anthropic API</option>
-                        <option value="ollama" ${upstream.api_type === 'ollama' ? 'selected' : ''}>Ollama API</option>
+                        <option value="ollama" ${upstream.api_type === 'ollama' ? 'selected' : ''}>Ollama (OpenAI兼容)</option>
                     </select>
                 </div>
                 <div class="form-group">
@@ -3085,7 +3085,7 @@ async function showCreateUpstreamModal() {
                 <select name="api_type" required>
                     <option value="openai">OpenAI API</option>
                     <option value="anthropic">Anthropic API</option>
-                    <option value="ollama">Ollama API</option>
+                    <option value="ollama">Ollama (OpenAI兼容)</option>
                 </select>
             </div>
             <div class="form-group">

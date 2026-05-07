@@ -64,6 +64,7 @@ pub async fn run_migrations(pool: &DbPool) -> Result<(), sqlx::Error> {
     }
 
     run_schema_migrations(pool).await?;
+    cleanup_content_columns(pool).await?;
     
     Ok(())
 }
@@ -80,7 +81,6 @@ async fn run_schema_migrations(pool: &DbPool) -> Result<(), sqlx::Error> {
         ("upstream_configs", "monthly_request_limit", "INTEGER"),
         ("conversations", "created_at", "TEXT NOT NULL DEFAULT (datetime('now'))"),
         ("proxy_logs", "routed_model", "TEXT"),
-        ("proxy_logs", "messages", "TEXT NOT NULL DEFAULT '[]'"),
         ("api_keys", "rpm_limit", "INTEGER NOT NULL DEFAULT 0"),
         ("api_keys", "tpm_limit", "INTEGER NOT NULL DEFAULT 0"),
         ("api_keys", "daily_limit", "INTEGER NOT NULL DEFAULT 0"),
@@ -210,6 +210,146 @@ async fn run_schema_migrations(pool: &DbPool) -> Result<(), sqlx::Error> {
         sqlx::query("DROP TABLE _conversation_messages_old")
             .execute(pool)
             .await?;
+    }
+
+    Ok(())
+}
+
+async fn cleanup_content_columns(pool: &DbPool) -> Result<(), sqlx::Error> {
+    let has_messages_col: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('proxy_logs') WHERE name = 'messages')",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    if has_messages_col {
+        tracing::info!("Removing 'messages' column from proxy_logs table (content stored in files)...");
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS _proxy_logs_new (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                api_key_id TEXT NOT NULL,
+                conversation_id TEXT,
+                model TEXT NOT NULL,
+                routed_model TEXT,
+                provider TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'success',
+                error_message TEXT,
+                log_file TEXT,
+                client_ip TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (tenant_id) REFERENCES tenants(id),
+                FOREIGN KEY (user_id) REFERENCES users(id),
+                FOREIGN KEY (api_key_id) REFERENCES api_keys(id)
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO _proxy_logs_new (id, tenant_id, user_id, api_key_id, conversation_id, model, routed_model, provider, input_tokens, output_tokens, total_tokens, status, error_message, log_file, client_ip, created_at)
+            SELECT id, tenant_id, user_id, api_key_id, conversation_id, model, routed_model, provider, input_tokens, output_tokens, total_tokens, status, error_message, log_file, client_ip, created_at
+            FROM proxy_logs
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query("DROP TABLE proxy_logs")
+            .execute(pool)
+            .await?;
+
+        sqlx::query("ALTER TABLE _proxy_logs_new RENAME TO proxy_logs")
+            .execute(pool)
+            .await?;
+
+        tracing::info!("Successfully removed 'messages' column from proxy_logs table");
+    }
+
+    let conv_msg_count: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(pgsize), 0) FROM dbstat WHERE name = 'conversation_messages'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+
+    if conv_msg_count > 0 {
+        tracing::info!("Clearing conversation_messages table ({} bytes, content stored in files)...", conv_msg_count);
+        sqlx::query("DELETE FROM conversation_messages")
+            .execute(pool)
+            .await?;
+    }
+
+    let has_request_body_col: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('proxy_logs') WHERE name = 'request_body')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false);
+
+    let has_response_body_col: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('proxy_logs') WHERE name = 'response_body')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false);
+
+    if has_request_body_col || has_response_body_col {
+        tracing::info!("Removing request_body/response_body columns from proxy_logs table...");
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS _proxy_logs_new2 (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                api_key_id TEXT NOT NULL,
+                conversation_id TEXT,
+                model TEXT NOT NULL,
+                routed_model TEXT,
+                provider TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'success',
+                error_message TEXT,
+                log_file TEXT,
+                client_ip TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (tenant_id) REFERENCES tenants(id),
+                FOREIGN KEY (user_id) REFERENCES users(id),
+                FOREIGN KEY (api_key_id) REFERENCES api_keys(id)
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO _proxy_logs_new2 (id, tenant_id, user_id, api_key_id, conversation_id, model, routed_model, provider, input_tokens, output_tokens, total_tokens, status, error_message, log_file, client_ip, created_at)
+            SELECT id, tenant_id, user_id, api_key_id, conversation_id, model, routed_model, provider, input_tokens, output_tokens, total_tokens, status, error_message, log_file, client_ip, created_at
+            FROM proxy_logs
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query("DROP TABLE proxy_logs")
+            .execute(pool)
+            .await?;
+
+        sqlx::query("ALTER TABLE _proxy_logs_new2 RENAME TO proxy_logs")
+            .execute(pool)
+            .await?;
+
+        tracing::info!("Successfully removed request_body/response_body columns from proxy_logs table");
     }
 
     Ok(())

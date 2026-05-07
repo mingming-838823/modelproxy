@@ -152,7 +152,7 @@ pub async fn set_model_visibility(
     model_name: &str,
     input: UpdateModelVisibilityRequest,
 ) -> Result<ModelVisibility, AppError> {
-    let all_users_visible = input.all_users_visible || input.user_ids.is_empty();
+    let all_users_visible = input.all_users_visible;
 
     let tenant_id: String =
         sqlx::query_scalar("SELECT tenant_id FROM upstream_configs WHERE id = ?")
@@ -515,8 +515,43 @@ pub async fn upsert_conditional_alias(
         ));
     }
 
+    let all_upstream_ids: Vec<Uuid> = input
+        .rules
+        .iter()
+        .map(|r| r.upstream_id)
+        .chain(std::iter::once(input.fallback.upstream_id))
+        .collect();
+
+    let mut api_types: Vec<String> = Vec::new();
+    for uid in &all_upstream_ids {
+        let row = sqlx::query("SELECT api_type FROM upstream_configs WHERE id = ?")
+            .bind(uid.to_string())
+            .fetch_optional(pool)
+            .await?;
+        match row {
+            Some(r) => {
+                let api_type: String = r.try_get("api_type").unwrap_or_else(|_| "openai".to_string());
+                api_types.push(api_type.to_lowercase());
+            }
+            None => {
+                return Err(AppError::BadRequest(format!(
+                    "上游 {} 不存在",
+                    uid
+                )));
+            }
+        }
+    }
+
+    let has_anthropic = api_types.iter().any(|t| t == "anthropic");
+    let has_openai = api_types.iter().any(|t| t != "anthropic");
+    if has_anthropic && has_openai {
+        return Err(AppError::BadRequest(
+            "同一智能路由中不能同时包含 Anthropic 和 OpenAI 类型的上游".to_string(),
+        ));
+    }
+
     let normalized_user_ids = normalize_user_ids(input.user_ids.clone());
-    let all_users_visible = input.all_users_visible || normalized_user_ids.is_empty();
+    let all_users_visible = input.all_users_visible;
 
     let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM conditional_alias_routes WHERE tenant_id = ? AND alias = ?")

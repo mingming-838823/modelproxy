@@ -934,7 +934,7 @@ async fn run_service(
         .route("/models", get(modelproxy::proxy::handlers::list_models))
         .route("/chat/completions", post(modelproxy::proxy::handlers::proxy_handler))
         .route("/completions", post(modelproxy::proxy::handlers::proxy_handler))
-        .route("/messages", post(modelproxy::proxy::handlers::proxy_handler))
+        .route("/messages", post(modelproxy::proxy::handlers::anthropic_proxy_handler))
         .with_state(proxy_state);
 
     let proxy_app = Router::new()
